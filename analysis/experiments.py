@@ -20,6 +20,7 @@ from gcaps import rt_test_gpu_seg_prio as rt_test_gcaps_gprio
 from mpcp import rt_test as rt_test_mpcp
 from fmlp import rt_test as rt_test_fmlp
 from default_driver import rt_test as rt_test_dft
+from npfp import rt_test as rt_test_npfp
 
 from taskset_gen import taskset_generation, print_taskset, Params
 
@@ -54,7 +55,10 @@ class policy_type(IntEnum):
 
     tsg_rr_suspend = 12
     tsg_rr_busy = 13
-    
+
+    npfp_busy    = 14
+    npfp_suspend = 15
+
 
 def select_policy(tasks: List[Task], policy_id: int) -> int:
     ret = False
@@ -82,6 +86,10 @@ def select_policy(tasks: List[Task], policy_id: int) -> int:
         ret = rt_test_dft(tasks, False)
     elif policy_id == policy_type.tsg_rr_busy:
         ret = rt_test_dft(tasks, True)
+    elif policy_id == policy_type.npfp_busy:
+        ret = rt_test_npfp(tasks, True)
+    elif policy_id == policy_type.npfp_suspend:
+        ret = rt_test_npfp(tasks, False)
 
     tasks = clear_task_response_time(tasks)
     return ret
@@ -120,7 +128,7 @@ def expr1(group_id: int, expr_id: int, loop_num: int):
             # policy_type.ioctl_suspend_gpu_prio,
             # policy_type.tsg_rr_busy,
             # policy_type.tsg_rr_suspend
-            0, 1, 2, 3, 9, 10, 12, 13
+            0, 1, 2, 3, 9, 10, 12, 13, 14, 15
         ]
     elif group_id == 3:  # experiment 3: gain of GPU segment priority assignment
         policies = [
