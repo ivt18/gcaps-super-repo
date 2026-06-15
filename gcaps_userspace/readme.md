@@ -61,6 +61,52 @@ sync mode: 0
 For each row, it shows: [pid, task id], min, mean, perc95, max. The unit is in milliseconds.
 
 
+## Varied-Workload Benchmarks
+Two additional benchmarks run real workloads (tiled matmul, 256-bin histogram,
+separable box convolution — ported from the SequenceScheduler suite) through
+the GCAPS harness, comparing GCAPS ioctl (`-i 1`) against the default TSG
+round-robin baseline (`-i 0`). Each release runs as one GCAPS GPU segment, and
+the response time is decomposed into `cpu_phase + sched_preempt_overhead +
+gpu_exec` (`sched_preempt_overhead` = launch/ioctl latency plus GPU-side
+scheduling/preemption delay).
+
+Build them with:
+```bash
+make workloadSweepGcaps workloadTasksetGcaps
+```
+
+**Size sweep** (`workloadSweepGcaps`) — one workload at a time in isolation,
+swept over matmul 256–2048, histogram 1M–64M, and convolution 512²–2048² ×
+kernel width 3/7/15; each config released `-n` times. Writes
+`results/workloadBench/sweep_{gcaps,tsg}.csv`.
+```bash
+./workloadSweepGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-n N] [-w WARMUP]
+# defaults: -i 0 -s 0 -b 0 -n 100 -w 10
+sudo ./workloadSweepGcaps -i 1   # GCAPS
+./workloadSweepGcaps -i 0        # TSG baseline
+```
+
+**Mixed taskset** (`workloadTasksetGcaps`) — the 7-task GCAPS Table 4 structure
+(same C_i, T_i, CPU affinities and SCHED_FIFO priorities) with the real
+workloads as the per-period GPU segments, one forked process per task. Writes
+`results/workloadBench/taskset_{gcaps,tsg}_{trace,results}.csv`. Real-time
+tasks need `sudo` for SCHED_FIFO.
+```bash
+./workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S]
+# defaults: -i 0 -s 0 -b 0 -d 30
+sudo ./workloadTasksetGcaps -i 1 -d 30   # GCAPS
+./workloadTasksetGcaps -i 0 -d 30        # TSG baseline
+```
+
+**Plotting** — run both modes of a benchmark, then:
+```bash
+python3 scripts/plot_workload_bench.py [--results-dir results/workloadBench]
+```
+This loads whichever of the four CSVs exist and writes `sweep_response.pdf`,
+`sweep_overhead.pdf`, `taskset_mort.pdf`, `taskset_breakdown.pdf`,
+`taskset_overhead.pdf`, and `taskset_gantt.pdf` into the results directory.
+
+
 ## References
 [1] Yidi Wang, Cong Liu, Daniel Wong, and Hyoseung Kim. GCAPS: GPU Context-Aware Preemptive Priority-based Scheduling for Real-Time Tasks. In Euromicro Conference on Real-Time Systems (ECRTS), 2024.
 [2] Björn B Brandenburg. The FMLP+: An asymptotically optimal real-time locking protocol for suspension-aware analysis. In 2014 26th Euromicro Conference on Real-Time Systems, pages 61–71. IEEE, 2014.

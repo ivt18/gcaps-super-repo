@@ -56,9 +56,9 @@ $(shell mkdir -p $(APP_BUILD_DIR))
 $(MODEL_BUILD_DIR):
 	mkdir -p $(APP_BUILD_DIR)
 # $(info    APP_BUILD_DIR: $(APP_BUILD_DIR))
-APP_LIST = mmulCPU/mmulCPU.cu mmulGPU/mmulGPU.cu dxtc/dxtc.cu hist/hist.cu projection/projection.cu
+APP_LIST = mmulCPU/mmulCPU.cu mmulGPU/mmulGPU.cu dxtc/dxtc.cu hist/hist.cu projection/projection.cu seqworkload/seqworkload.cu
 APP_SRC = $(patsubst %,$(APP_DIR)/%,$(APP_LIST))
-APP_OBJ_LIST = mmulCPU.o mmulGPU.o dxtc.o hist.o projection.o
+APP_OBJ_LIST = mmulCPU.o mmulGPU.o dxtc.o hist.o projection.o seqworkload.o
 
 APP_OBJ = $(patsubst %,$(APP_BUILD_DIR)/%,$(APP_OBJ_LIST))
 
@@ -75,10 +75,13 @@ $(APP_BUILD_DIR)/dxtc.o: $(APP_DIR)/dxtc/dxtc.cu
 $(APP_BUILD_DIR)/hist.o: $(APP_DIR)/hist/hist.cu 
 	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
-$(APP_BUILD_DIR)/projection.o: $(APP_DIR)/projection/projection.cu 
+$(APP_BUILD_DIR)/projection.o: $(APP_DIR)/projection/projection.cu
 	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
-all: main tsg_ctxsw
+$(APP_BUILD_DIR)/seqworkload.o: $(APP_DIR)/seqworkload/seqworkload.cu
+	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+
+all: main tsg_ctxsw workloadSweepGcaps workloadTasksetGcaps
 # Build
 BUILD_DIR = build
 $(shell mkdir -p $(BUILD_DIR))
@@ -95,6 +98,16 @@ tsg_ctxsw: $(BUILD_DIR)/tsg_ctxsw.o  $(APP_OBJ)
 $(BUILD_DIR)/tsg_ctxsw.o: tsg_ctxsw.cc
 	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
+workloadSweepGcaps: $(BUILD_DIR)/workloadSweepGcaps.o $(APP_BUILD_DIR)/seqworkload.o
+	$(NVCC) $(INCLUDES) $(LDFLAGS) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
+$(BUILD_DIR)/workloadSweepGcaps.o: workloadSweepGcaps.cc
+	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+
+workloadTasksetGcaps: $(BUILD_DIR)/workloadTasksetGcaps.o $(APP_BUILD_DIR)/seqworkload.o
+	$(NVCC) $(INCLUDES) $(LDFLAGS) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
+$(BUILD_DIR)/workloadTasksetGcaps.o: workloadTasksetGcaps.cc
+	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+
 .PHONY: clean
 clean:
-	rm -rf $(APP_BUILD_DIR) $(BUILD_DIR) build main tsg_ctxsw
+	rm -rf $(APP_BUILD_DIR) $(BUILD_DIR) build main tsg_ctxsw workloadSweepGcaps workloadTasksetGcaps
