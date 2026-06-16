@@ -174,6 +174,7 @@ SeqWorkload::SeqWorkload(SeqWlType type_, unsigned int p1_, unsigned int p2_,
 	fd   = fd_;
 	sync_mode     = sync_mode_;
 	ioctl_enabled = ioctl_enabled_;
+	suspend_      = suspension_;
 
 	if (suspension_)
 		event_flags |= cudaEventBlockingSync;
@@ -206,7 +207,12 @@ void SeqWorkload::taskInit()
 {
 	cuInit(0);
 	cuDeviceGet(&device, 0);
-	cuCtxCreate(&ctx, 0, device);
+	/* Blocking-sync context (suspend mode) so CPU waits sleep instead of
+	 * busy-polling — incl. taskInit's cudaDeviceSynchronize and verify()'s
+	 * stream sync, which the per-event blocking flag does not cover. Critical
+	 * under SCHED_FIFO + sched_rt_runtime_us=-1: a spinning RT wait can starve
+	 * the nvgpu driver thread and wedge the GPU. */
+	cuCtxCreate(&ctx, suspend_ ? CU_CTX_SCHED_BLOCKING_SYNC : 0, device);
 
 	/* macro-bracket events follow the native apps' timing-disable convention */
 	if (event_flags != 0) {

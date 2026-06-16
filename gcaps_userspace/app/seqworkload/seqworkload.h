@@ -59,6 +59,7 @@ private:
 	int          fd;
 	bool         sync_mode;
 	bool         ioctl_enabled;
+	bool         suspend_ = false;   /* blocking-sync (vs busy spin) for waits */
 	int          event_flags = 0;
 
 	/* timing events (always timing-enabled) bracketing the kernels */
