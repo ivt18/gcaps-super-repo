@@ -35,6 +35,13 @@
  * Real-time tasks (1-5) request SCHED_FIFO — run with sudo for that to take
  * effect (warns and continues otherwise).
  *
+ * Start-up is STAGGERED: each task creates its CUDA context and runs verify()
+ * in its own 1 s slot, so the 7 contexts are brought up one at a time. Creating
+ * and first-touching all contexts simultaneously spins in the driver during
+ * concurrent context bring-up (and deadlocks under -i 1); serialising it avoids
+ * that. The synchronized periodic run only begins after every context is warm,
+ * so there is a ~(NUM_TASKS+1) s one-time warm-up before the timed window.
+ *
  * Usage:  workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S]
  *         (defaults: -i 0 -s 0 -b 0 -d 30)
  * Output (-i 1 -> gcaps, else tsg):
@@ -116,8 +123,15 @@ static void sleep_until_abs_ns(uint64_t target_ns)
 }
 
 // Inherited by every forked child (set before fork()).
-static uint64_t g_sync_start_ns   = 0;
+static uint64_t g_init_start_ns   = 0;   // epoch for the staggered per-task init
+static uint64_t g_sync_start_ns   = 0;   // synchronized periodic-loop start
 static uint64_t g_experiment_ns   = 0;
+
+// Per-task init is staggered by this much so the 7 CUDA contexts are created
+// and first touch the GPU one at a time. Creating/initialising all contexts
+// simultaneously spins (and deadlocks under -i 1) in the driver during
+// concurrent context bring-up; serialising it avoids the storm. See README.
+static constexpr uint64_t INIT_STAGGER_NS = 1000000000ULL; /* 1 s per task */
 
 // ============================================================================
 // Child process: run one task for the experiment window, dump its trace rows.
@@ -144,6 +158,11 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 			                "— continuing SCHED_OTHER\n",
 			        td.name, td.fifo_priority);
 	}
+
+	/* Staggered start-up: each task initialises its CUDA context (and runs
+	 * verify()) in its own slot so context bring-up is serialised across tasks
+	 * rather than a simultaneous 7-context storm that hangs the driver. */
+	sleep_until_abs_ns(g_init_start_ns + (uint64_t)task_idx * INIT_STAGGER_NS);
 
 	SeqWorkload* wl = nullptr;
 	if (td.is_gpu) {
@@ -347,13 +366,23 @@ int main(int argc, char** argv)
 	mkdir("results", 0755);
 	mkdir("results/workloadBench", 0755);
 
-	static constexpr uint64_t STARTUP_DELAY_NS = 500000000ULL; /* 500 ms */
+	/* Lead time before the first task initialises (lets all forks settle). */
+	static constexpr uint64_t PREINIT_NS = 500000000ULL;        /* 500 ms */
+	/* The staggered inits occupy NUM_TASKS slots; the synchronized periodic
+	 * run starts one extra margin later so every context is warmed and ready. */
+	static constexpr uint64_t POSTINIT_MARGIN_NS = 1000000000ULL; /* 1 s */
 	g_experiment_ns = duration_s * 1000000000ULL;
-	g_sync_start_ns = host_ns() + STARTUP_DELAY_NS;
+	g_init_start_ns = host_ns() + PREINIT_NS;
+	g_sync_start_ns = g_init_start_ns
+	                + (uint64_t)NUM_TASKS * INIT_STAGGER_NS
+	                + POSTINIT_MARGIN_NS;
 
-	printf("Taskset: mode=%s, duration=%llus, starts in %.0f ms\n",
+	printf("Taskset: mode=%s, duration=%llus, staggered init "
+	       "(%d x %.1f s) then experiment starts in %.1f s\n",
 	       ioctl_enabled ? "GCAPS-ioctl" : "TSG-default",
-	       (unsigned long long)duration_s, (double)STARTUP_DELAY_NS / 1.0e6);
+	       (unsigned long long)duration_s, NUM_TASKS,
+	       (double)INIT_STAGGER_NS / 1.0e9,
+	       (double)(g_sync_start_ns - host_ns()) / 1.0e9);
 
 	std::vector<pid_t> children;
 	for (int i = 0; i < NUM_TASKS; ++i) {

@@ -70,6 +70,15 @@ the response time is decomposed into `cpu_phase + sched_preempt_overhead +
 gpu_exec` (`sched_preempt_overhead` = launch/ioctl latency plus GPU-side
 scheduling/preemption delay).
 
+**Before running** (in addition to the Preparations section above):
+```bash
+sudo nvpmodel -m 0 && sudo jetson_clocks          # all cores + max, fixed clocks
+sudo sysctl -w kernel.sched_rt_runtime_us=-1      # REQUIRED for SCHED_FIFO here
+```
+On these L4T kernels (`CONFIG_RT_GROUP_SCHED` + systemd cgroups) `SCHED_FIFO`
+fails — even under `sudo` — unless `sched_rt_runtime_us` is `-1`; without it the
+taskset's real-time tasks silently fall back to `SCHED_OTHER`.
+
 Build them with:
 ```bash
 make workloadSweepGcaps workloadTasksetGcaps
@@ -92,11 +101,25 @@ workloads as the per-period GPU segments, one forked process per task. Writes
 `results/workloadBench/taskset_{gcaps,tsg}_{trace,results}.csv`. Real-time
 tasks need `sudo` for SCHED_FIFO.
 ```bash
-./workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S]
+sudo ./workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S]
 # defaults: -i 0 -s 0 -b 0 -d 30
-sudo ./workloadTasksetGcaps -i 1 -d 30   # GCAPS
-./workloadTasksetGcaps -i 0 -d 30        # TSG baseline
+sudo ./workloadTasksetGcaps -i 1 -s 1 -d 30   # GCAPS
+sudo ./workloadTasksetGcaps -i 0 -s 1 -d 30   # TSG baseline
 ```
+**Always pass `-s 1` (suspend / blocking sync) for the taskset.** With `-s 0`
+(busy spin) the real-time tasks spin-wait on the GPU and, with RT throttling
+disabled, starve the nvgpu driver thread and wedge the GPU. `-s 1` makes those
+waits sleep instead.
+
+**Staggered start-up.** The 7 CUDA contexts are created one at a time (one 1 s
+slot per task), because bringing them all up simultaneously spins in the driver
+during concurrent context init and deadlocks under `-i 1`. The timed window
+therefore begins only after a one-time warm-up of ~(`NUM_TASKS`+1) s — the
+binary prints when the experiment will start. The GPU workloads themselves are
+very light (≈17% total GPU utilisation on AGX Orin), so the taskset is easily
+schedulable once init is serialised.
+
+If it appears to hang, see [Troubleshooting](#troubleshooting-the-taskset) below.
 
 **Plotting** — run both modes of a benchmark, then:
 ```bash
@@ -105,6 +128,24 @@ python3 scripts/plot_workload_bench.py [--results-dir results/workloadBench]
 This loads whichever of the four CSVs exist and writes `sweep_response.pdf`,
 `sweep_overhead.pdf`, `taskset_mort.pdf`, `taskset_breakdown.pdf`,
 `taskset_overhead.pdf`, and `taskset_gantt.pdf` into the results directory.
+
+### Troubleshooting the taskset
+- **It hangs (no progress, prompt never returns).** Almost always one of:
+  forgot `-s 1` (busy spin starves the driver — see above), forgot
+  `sched_rt_runtime_us=-1` (RT tasks fall back to `SCHED_OTHER`), or a previous
+  hung run left the GPU wedged. Recover with `sudo pkill -9 -f workloadTasksetGcaps`;
+  if `ps -eLo pid,stat,comm | grep -i workload` shows any process in `D`
+  (uninterruptible) state, the GPU is wedged and only `sudo reboot` clears it.
+  Always reboot after a hang before retrying.
+- **`could not open results/workloadBench/...csv`.** A previous `sudo` run made
+  `results/` root-owned; run with `sudo` consistently, or
+  `sudo chown -R $USER:$USER results`.
+- **`cudaErrorLaunchTimeout` / spinning in `taskInit`.** The simultaneous
+  context-init storm — fixed by the staggered start-up; make sure you rebuilt
+  (`make clean && make workloadTasksetGcaps`) and are on `-s 1`.
+- **Power mode.** Mode numbers are board-specific; use `-m 0` (MAXN) on Orin for
+  all cores + max clocks. Copying another board's mode number (e.g. `-m 2`) can
+  silently select a reduced-core/low-clock profile.
 
 
 ## References
