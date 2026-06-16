@@ -101,11 +101,24 @@ workloads as the per-period GPU segments, one forked process per task. Writes
 `results/workloadBench/taskset_{gcaps,tsg}_{trace,results}.csv`. Real-time
 tasks need `sudo` for SCHED_FIFO.
 ```bash
-sudo ./workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S]
-# defaults: -i 0 -s 0 -b 0 -d 30
-sudo ./workloadTasksetGcaps -i 1 -s 1 -d 30   # GCAPS
-sudo ./workloadTasksetGcaps -i 0 -s 1 -d 30   # TSG baseline
+sudo ./workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S] [-k N]
+# defaults: -i 0 -s 0 -b 0 -d 30, all GPU tasks
+sudo ./workloadTasksetGcaps -i 1 -s 1 -d 30 -k 5   # GCAPS (5 GPU tasks — see limit)
+sudo ./workloadTasksetGcaps -i 0 -s 1 -d 30        # TSG baseline (all 6 GPU tasks)
 ```
+`-k N` activates only the first N GPU tasks (the CPU-only task always runs).
+
+**GCAPS deadlocks at 6 concurrent GPU contexts on this driver — run GCAPS mode
+with `-k 5`.** The taskset has 6 GPU tasks; under `-i 1`, six processes
+simultaneously elevating via the runlist ioctl wedge the driver (confirmed with
+SCHED_FIFO active). GCAPS admits one task's TSGs to the runlist at a time and
+queues the rest (`tsg_running` / `tsg_pending` in `gcaps_driver_patch`), and that
+bookkeeping deadlocks at 6. **The authors' own case study never exceeds 5 GPU
+contexts** — `taskset.csv` is 6 tasks but task 3 (workload id 1, `MatrixMulCPU`)
+is CPU-only, so only 5 use the GPU. So this is a GCAPS driver limit, not a bug
+here; cap GCAPS runs at 5 GPU tasks. (TSG mode, `-i 0`, has no elevation and runs
+all 6 fine.) For a like-for-like GCAPS-vs-TSG comparison, pass `-k 5` to **both**.
+
 **Always pass `-s 1` (suspend / blocking sync) for the taskset.** With `-s 0`
 (busy spin) the real-time tasks spin-wait on the GPU and, with RT throttling
 disabled, starve the nvgpu driver thread and wedge the GPU. `-s 1` makes those
@@ -130,10 +143,14 @@ This loads whichever of the four CSVs exist and writes `sweep_response.pdf`,
 `taskset_overhead.pdf`, and `taskset_gantt.pdf` into the results directory.
 
 ### Troubleshooting the taskset
+- **`-i 1` hangs but `-i 0` works.** You're over the GCAPS 6-GPU-context limit —
+  run GCAPS mode with `-k 5` (see the limit note above). `-i 0` (TSG) has no such
+  limit.
 - **It hangs (no progress, prompt never returns).** Almost always one of:
   forgot `-s 1` (busy spin starves the driver — see above), forgot
-  `sched_rt_runtime_us=-1` (RT tasks fall back to `SCHED_OTHER`), or a previous
-  hung run left the GPU wedged. Recover with `sudo pkill -9 -f workloadTasksetGcaps`;
+  `sched_rt_runtime_us=-1` (RT tasks fall back to `SCHED_OTHER`), over the 6-GPU
+  context limit under `-i 1` (use `-k 5`), or a previous hung run left the GPU
+  wedged. Recover with `sudo pkill -9 -f workloadTasksetGcaps`;
   if `ps -eLo pid,stat,comm | grep -i workload` shows any process in `D`
   (uninterruptible) state, the GPU is wedged and only `sudo reboot` clears it.
   Always reboot after a hang before retrying.
