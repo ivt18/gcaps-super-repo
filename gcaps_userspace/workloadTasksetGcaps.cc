@@ -42,8 +42,11 @@
  * that. The synchronized periodic run only begins after every context is warm,
  * so there is a ~(NUM_TASKS+1) s one-time warm-up before the timed window.
  *
- * Usage:  workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S]
- *         (defaults: -i 0 -s 0 -b 0 -d 30)
+ * Usage:  workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S] [-k N]
+ *         (defaults: -i 0 -s 0 -b 0 -d 30, all GPU tasks)
+ *         -k N : activate only the first N GPU tasks (CPU-only task always
+ *                runs) — for bisecting how many concurrent GPU contexts the
+ *                GCAPS elevation path tolerates before deadlocking.
  * Output (-i 1 -> gcaps, else tsg):
  *   results/workloadBench/taskset_{gcaps,tsg}_trace.csv
  *   results/workloadBench/taskset_{gcaps,tsg}_results.csv
@@ -343,13 +346,15 @@ int main(int argc, char** argv)
 
 	int ioctl_enabled = 0, suspension = 0, sync_mode = 0;
 	uint64_t duration_s = 30;
+	int gpu_limit = -1;   /* -1 = all GPU tasks; else activate only first N */
 	int opt;
-	while ((opt = getopt(argc, argv, "i:s:b:d:")) != EOF) {
+	while ((opt = getopt(argc, argv, "i:s:b:d:k:")) != EOF) {
 		switch (opt) {
 			case 'i': ioctl_enabled = atoi(optarg); break;
 			case 's': suspension    = atoi(optarg); break;
 			case 'b': sync_mode     = atoi(optarg); break;
 			case 'd': duration_s    = strtoull(optarg, nullptr, 10); break;
+			case 'k': gpu_limit     = atoi(optarg); break;
 			default:  fprintf(stderr, "bad option\n"); return 1;
 		}
 	}
@@ -378,14 +383,33 @@ int main(int argc, char** argv)
 	                + POSTINIT_MARGIN_NS;
 
 	printf("Taskset: mode=%s, duration=%llus, staggered init "
-	       "(%d x %.1f s) then experiment starts in %.1f s\n",
+	       "(%d x %.1f s) then experiment starts in %.1f s",
 	       ioctl_enabled ? "GCAPS-ioctl" : "TSG-default",
 	       (unsigned long long)duration_s, NUM_TASKS,
 	       (double)INIT_STAGGER_NS / 1.0e9,
 	       (double)(g_sync_start_ns - host_ns()) / 1.0e9);
+	if (gpu_limit >= 0)
+		printf("  [GPU tasks capped at %d]", gpu_limit);
+	printf("\n");
+
+	/* Remove stale per-task trace fragments so a capped run (fewer tasks) does
+	 * not merge leftovers from a previous, larger run. */
+	for (int i = 0; i < NUM_TASKS; ++i) {
+		char path[160];
+		snprintf(path, sizeof(path),
+		         "results/workloadBench/.tsk_%s_%d.csv", mode_tag, i);
+		remove(path);
+	}
 
 	std::vector<pid_t> children;
+	int gpu_forked = 0;
 	for (int i = 0; i < NUM_TASKS; ++i) {
+		/* -k N: activate only the first N GPU tasks (skip the rest).
+		 * CPU-only tasks always run — they create no GPU context. */
+		if (TASKS[i].is_gpu && gpu_limit >= 0 && gpu_forked >= gpu_limit)
+			continue;
+		if (TASKS[i].is_gpu) ++gpu_forked;
+
 		pid_t pid = fork();
 		if (pid == 0) {
 			run_task(i, fd, (bool)sync_mode, (bool)ioctl_enabled,
