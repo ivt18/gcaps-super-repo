@@ -4,6 +4,7 @@ This folder includes the necessary files to run the schedulability analysis in G
 - Default GPU round-robin: suspend + busy (first attempt to bound default GPU scheduling approach [1])
 - FMLP+: suspend + busy [2]
 - MPCP: suspend + busy [3]
+- NP-FP: suspend + busy (non-preemptive fixed-priority on-GPU CUDA-graph scheduler from the MSc thesis `singleTaskSched`; hybrid FPP GPU analysis + CPU same-core interference, see `npfp.py`)
 
 ## How to run
 The experiments can be run with the following command:

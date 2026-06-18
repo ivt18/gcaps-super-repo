@@ -15,6 +15,9 @@ import argparse
 
 from sched_common import *
 
+import gcaps   # for overriding gcaps.epsilon (GCAPS runlist-update overhead) at runtime
+import npfp    # for overriding npfp.SCHEDULING_OVERHEAD (seq dispatch overhead) at runtime
+
 from gcaps import rt_test as rt_test_gcaps
 from gcaps import rt_test_gpu_seg_prio as rt_test_gcaps_gprio
 from mpcp import rt_test as rt_test_mpcp
@@ -62,6 +65,12 @@ class policy_type(IntEnum):
 
 def select_policy(tasks: List[Task], policy_id: int) -> int:
     ret = False
+    # Evaluate every policy on a fresh GPU-priority baseline (= RM/CPU prio).
+    # rt_test_gcaps_gprio mutates prio_gpu via its Audsley search; resetting here
+    # stops that mutation from leaking into later policies (e.g. npfp) that read
+    # prio_gpu on the same shared task list.
+    for t in tasks:
+        t.prio_gpu = t.prio
     if policy_id == policy_type.mpcp_suspend:
         ret = rt_test_mpcp(tasks, False)
     elif policy_id == policy_type.mpcp_busy:
@@ -237,7 +246,25 @@ if __name__ == "__main__":
     parser.add_argument('-g', '--group', type=int, help='Experiment group id', required=True)
     parser.add_argument('-e', '--expr', type=int, help='Experiment id', required=True)
     parser.add_argument('-n', '--ntasks', type=int, help='Number of tasksets', required=True)
+    # Measured per-dispatch overheads in microseconds.  The analysis time unit is
+    # milliseconds (task periods are in ms, GCAPS Table 3), so these are divided by
+    # 1000.  Left unset, the built-in defaults are unchanged (gcaps.epsilon = 1 ms,
+    # npfp.SCHEDULING_OVERHEAD = 0.135 ms), preserving existing behaviour.
+    parser.add_argument('--gcaps-overhead-us', type=float, default=None,
+                        help='GCAPS runlist-update overhead epsilon, in microseconds '
+                             '(sets gcaps.epsilon = value/1000 ms; e.g. 1149 -> 1.149)')
+    parser.add_argument('--seq-overhead-us', type=float, default=None,
+                        help='Sequence-scheduler per-dispatch overhead, in microseconds '
+                             '(sets npfp.SCHEDULING_OVERHEAD = value/1000 ms; e.g. 155 -> 0.155)')
     args = parser.parse_args()
+
+    if args.gcaps_overhead_us is not None:
+        gcaps.epsilon = args.gcaps_overhead_us / 1000.0  # us -> ms
+        print(f"GCAPS overhead (epsilon) = {args.gcaps_overhead_us} us -> {gcaps.epsilon} ms")
+    if args.seq_overhead_us is not None:
+        npfp.SCHEDULING_OVERHEAD = args.seq_overhead_us / 1000.0  # us -> ms
+        print(f"Seq dispatch overhead = {args.seq_overhead_us} us -> {npfp.SCHEDULING_OVERHEAD} ms")
+
     if args.group == 1 or args.group == 3:
         expr1(args.group, args.expr, args.ntasks)
             

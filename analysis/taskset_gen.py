@@ -302,6 +302,12 @@ def taskset_generation(params: Params, expr_gid: int, num_tasks: int = -1, perce
             num_be_tasks = int(len(tasks) * percentage_be_tasks)
             tasks[i].prio = len(tasks) - num_be_tasks - i # the larger the higher
         tasks[i].id = i
+    # GPU priority defaults to the CPU (RM) priority; the two may be decoupled by
+    # a later assignment (e.g. GCAPS's Audsley search, or an npfp experiment).
+    # This must be populated explicitly: prio_gpu is otherwise stale from
+    # __init__, where it was copied from prio while prio was still 0.
+    for i in range(len(tasks)):
+        tasks[i].prio_gpu = tasks[i].prio
     # * get list of higher-priority tasks, hpp and hp
     for i in range(len(tasks)):
         if tasks[i].prio == -1:

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Usage: ./run_eval.sh [group] [expr_id] [n_tasksets]
+# Usage: ./run_eval.sh [group] [expr_id] [n_tasksets] [extra experiments.py flags...]
 #   group      - experiment group (default: 1)
 #   expr_id    - experiment id    (default: 4)
 #   n_tasksets - tasksets per point (default: 200)
+#   extra flags - any args after the three positionals are forwarded verbatim to
+#                 experiments.py, e.g. to inject measured per-dispatch overheads:
+#                 ./run_eval.sh 1 4 200 --gcaps-overhead-us 1149 --seq-overhead-us 155
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -10,6 +13,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 GROUP=${1:-1}
 EXPR=${2:-4}
 N=${3:-200}
+# Consume the (up to three) positionals, forward the rest to experiments.py.
+shift $(( $# > 3 ? 3 : $# ))
+EXTRA=("$@")
 
 # --- Column headers per group ------------------------------------------------
 if   [ "$GROUP" -eq 1 ]; then
@@ -37,9 +43,9 @@ esac
 TMPFILE=$(mktemp)
 trap 'rm -f "$TMPFILE"' EXIT
 
-echo "Running: python3 experiments.py -g $GROUP -e $EXPR -n $N"
+echo "Running: python3 experiments.py -g $GROUP -e $EXPR -n $N ${EXTRA[*]}"
 echo
-python3 experiments.py -g "$GROUP" -e "$EXPR" -n "$N" 2>&1 | tee "$TMPFILE"
+python3 experiments.py -g "$GROUP" -e "$EXPR" -n "$N" "${EXTRA[@]}" 2>&1 | tee "$TMPFILE"
 
 DATA=$(grep -E '^[0-9]' "$TMPFILE")
 
