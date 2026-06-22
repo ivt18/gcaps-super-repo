@@ -9,13 +9,19 @@
  * are the ported real workloads (matmul / histogram / convolution) run as one
  * GCAPS GPU segment per period:
  *
- *   1  hist_16M       histogram 16M    C=1ms  T=100ms CPU={1}   FIFO=5
- *   2  mm_1024        matmul 1024      C=2ms  T=150ms CPU={2}   FIFO=4
- *   3  cpu_only       (CPU only)       C=67ms T=200ms CPU={2}   FIFO=3
- *   4  conv_1024_k7   conv 1024^2 k7   C=12ms T=300ms CPU={1}   FIFO=2
- *   5  conv_2048_k15  conv 2048^2 k15  C=2ms  T=400ms CPU={1}   FIFO=1
- *   6  mm_2048        matmul 2048      C=4ms  T=200ms CPU={4}   OTHER
- *   7  hist_4M        histogram 4M     C=4ms  T=67ms  CPU={4,5} OTHER
+ *   1  hist_16M       histogram 16M    C=1ms  T=100ms CPU={1}   FIFO=7
+ *   2  mm_1024        matmul 1024      C=2ms  T=150ms CPU={2}   FIFO=6
+ *   3  cpu_only       (CPU only)       C=67ms T=200ms CPU={2}   FIFO=5
+ *   4  conv_1024_k7   conv 1024^2 k7   C=12ms T=300ms CPU={1}   FIFO=4
+ *   5  conv_2048_k15  conv 2048^2 k15  C=2ms  T=400ms CPU={1}   FIFO=3
+ *   6  mm_2048        matmul 2048      C=4ms  T=200ms CPU={4}   FIFO=2
+ *   7  hist_4M        histogram 4M     C=4ms  T=67ms  CPU={4,5} FIFO=1
+ *
+ * NOTE: tasks 6 and 7 are GCAPS Table 4's best-effort tasks, but they are run
+ * here at the two LOWEST real-time priorities rather than SCHED_OTHER — this
+ * avoids a GCAPS driver deadlock with >1 best-effort GPU task (see
+ * best-effort-tasks-bug.md) and matches the SequenceScheduler benchmark, which
+ * has no best-effort class.
  *
  * One forked process per task (separate CUcontext) — required because GCAPS's
  * runlist-priority ioctl acts on a pid, so tasks must be distinct processes
@@ -32,8 +38,8 @@
  *         a higher-priority one), so this is scheduling + preemption overhead,
  *         not a FIFO queue wait.
  *
- * Real-time tasks (1-5) request SCHED_FIFO — run with sudo for that to take
- * effect (warns and continues otherwise).
+ * All tasks request SCHED_FIFO — run with sudo for that to take effect (warns
+ * and continues otherwise).
  *
  * Start-up is STAGGERED: each task creates its CUDA context and runs verify()
  * in its own 1 s slot, so the 7 contexts are brought up one at a time. Creating
@@ -90,14 +96,20 @@ struct BenchTaskDef {
 	int          fifo_priority;  /* 0 = SCHED_OTHER */
 };
 
+/* All GPU tasks use distinct SCHED_FIFO priorities (no best-effort tasks): the
+ * two formerly best-effort tasks (mm_2048, hist_4M) are given the two LOWEST
+ * real-time priorities instead of SCHED_OTHER. This (a) avoids the GCAPS driver
+ * best-effort deadlock (>1 concurrently-running best-effort GPU task — see
+ * best-effort-tasks-bug.md) and (b) matches the SequenceScheduler benchmark,
+ * which priority-schedules every GPU task and has no best-effort class. */
 static const BenchTaskDef TASKS[NUM_TASKS] = {
-	{"hist_16M",      true,  SeqWlType::HISTOGRAM,   16u << 20, 0,  1, 100, {1, -1}, 5},
-	{"mm_1024",       true,  SeqWlType::MATMUL,      1024,      0,  2, 150, {2, -1}, 4},
-	{"cpu_only",      false, SeqWlType::MATMUL,      0,         0, 67, 200, {2, -1}, 3},
-	{"conv_1024_k7",  true,  SeqWlType::CONVOLUTION, 1024,      7, 12, 300, {1, -1}, 2},
-	{"conv_2048_k15", true,  SeqWlType::CONVOLUTION, 2048,     15,  2, 400, {1, -1}, 1},
-	{"mm_2048",       true,  SeqWlType::MATMUL,      2048,      0,  4, 200, {4, -1}, 0},
-	{"hist_4M",       true,  SeqWlType::HISTOGRAM,   4u << 20,  0,  4,  67, {4,  5}, 0},
+	{"hist_16M",      true,  SeqWlType::HISTOGRAM,   16u << 20, 0,  1, 100, {1, -1}, 7},
+	{"mm_1024",       true,  SeqWlType::MATMUL,      1024,      0,  2, 150, {2, -1}, 6},
+	{"cpu_only",      false, SeqWlType::MATMUL,      0,         0, 67, 200, {2, -1}, 5},
+	{"conv_1024_k7",  true,  SeqWlType::CONVOLUTION, 1024,      7, 12, 300, {1, -1}, 4},
+	{"conv_2048_k15", true,  SeqWlType::CONVOLUTION, 2048,     15,  2, 400, {1, -1}, 3},
+	{"mm_2048",       true,  SeqWlType::MATMUL,      2048,      0,  4, 200, {4, -1}, 2},
+	{"hist_4M",       true,  SeqWlType::HISTOGRAM,   4u << 20,  0,  4,  67, {4,  5}, 1},
 };
 
 // ============================================================================
