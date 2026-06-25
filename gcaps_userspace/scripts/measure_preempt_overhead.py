@@ -56,6 +56,11 @@ import re
 import subprocess
 import sys
 
+# Percentile of non-preempted active time used as the warm-execution baseline.
+# Low enough to sit on the warm floor (immune to start-up warmup / contention,
+# which only inflate), not the noisy single minimum.
+BASELINE_PCTL = 20
+
 GCAPS_EV_RE = re.compile(
     r"GCAPS_EV\s+ts=(\d+)\s+cpid=(-?\d+)\s+prio=(-?\d+)\s+add=(\d+)\s+"
     r"rlupd=(\d+)\s+elapsed_us=(-?\d+)\s+preempted=(-?\d+)\s+resumed=(-?\d+)"
@@ -228,13 +233,6 @@ def report(events, rels, label, trace_path=None):
     # ---- (2) execution-time extension when preempted --------------------- #
     susp = reconstruct_suspend_intervals(events)
 
-    # Earliest preemption anywhere in the run: releases finishing before this
-    # ran with the preemptors idle, so they form an uncontaminated baseline
-    # (the microbench's PREEMPTOR_ACTIVATION window). Falls back to all
-    # non-preempted releases when there is no such idle phase (e.g. taskset).
-    first_pre_ts = min((s for ivs in susp.values() for (s, _t) in ivs),
-                       default=None)
-
     # annotate each release with suspended time + #preemptions during its window
     by_name = {}
     for r in rels:
@@ -265,26 +263,33 @@ def report(events, rels, label, trace_path=None):
           "[correct if cudaEvent INCLUDES suspension]")
     print("  the slope d(gpu_wall)/d(suspended) over preempted releases says "
           "which holds.")
+    print(f"  baseline = warm floor: p{BASELINE_PCTL} of non-preempted active "
+          "time (robust to start-up clock-ramp/cache warmup, which inflates "
+          "the first releases).")
 
     for name in sorted(by_name):
         recs = by_name[name]
         all_clean = [x for x in recs if x["npre"] == 0]
-        idle = [x for x in all_clean
-                if first_pre_ts is not None and x["end"] <= first_pre_ts]
-        if idle:
-            base_recs, base_src = idle, "preemptor-idle window"
-        else:
-            base_recs, base_src = all_clean, "all non-preempted (no idle window)"
-        base_gpu = median([x["gpu"] for x in base_recs]) if base_recs \
+        # Baseline = steady-state WARM floor of non-preempted active execution.
+        # A low percentile isolates the uncontended warm time: start-up warmup
+        # and any residual contention can only inflate active time above it, so
+        # the median/idle-window are biased high; the low percentile is not.
+        clean_active = sorted(x["active"] for x in all_clean)
+        clean_gpu = sorted(x["gpu"] for x in all_clean)
+        base_active = pct(clean_active, BASELINE_PCTL) if clean_active \
             else float("nan")
-        base_active = median([x["active"] for x in base_recs]) if base_recs \
-            else float("nan")
+        base_gpu = pct(clean_gpu, BASELINE_PCTL) if clean_gpu else float("nan")
 
         pre = [x for x in recs if x["npre"] > 0]
         print(f"\n  [{name}]  releases={len(recs)}  "
               f"non-preempted={len(all_clean)}  preempted={len(pre)}")
-        print(f"    baseline ({base_src}, n={len(base_recs)}): "
-              f"gpu_wall median = {base_gpu:.3f} ms")
+        if all_clean:
+            print(f"    baseline warm floor (p{BASELINE_PCTL} of {len(all_clean)} "
+                  f"non-preempted) : {base_active:.3f} ms  "
+                  f"(min {clean_active[0]:.3f}, median {median(clean_active):.3f}, "
+                  f"max {clean_active[-1]:.3f})")
+        else:
+            print("    baseline: (no non-preempted releases)")
         if not pre:
             continue
         print(f"    gpu_wall when preempted       : "
@@ -300,7 +305,7 @@ def report(events, rels, label, trace_path=None):
             verdict = "ambiguous (mixed regimes or too few samples)"
         print(f"    d(gpu_wall)/d(suspended)      : slope={slope:.3f} "
               f"r={corr:.3f}   [{verdict}]")
-        if base_recs:
+        if all_clean:
             ext_raw = [x["gpu"] - base_gpu for x in pre]
             ext_act = [x["active"] - base_active for x in pre]
             pp_raw = [(x["gpu"] - base_gpu) / x["npre"] for x in pre]
