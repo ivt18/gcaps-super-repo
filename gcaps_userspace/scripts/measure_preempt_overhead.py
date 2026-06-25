@@ -205,7 +205,8 @@ def load_trace(path):
 # --------------------------------------------------------------------------- #
 # report
 # --------------------------------------------------------------------------- #
-def report(events, rels, label, trace_path=None):
+def report(events, rels, label, trace_path=None, baselines=None):
+    baselines = baselines or {}
     print(f"\n===================== {label} =====================")
 
     if not events:
@@ -270,26 +271,35 @@ def report(events, rels, label, trace_path=None):
     for name in sorted(by_name):
         recs = by_name[name]
         all_clean = [x for x in recs if x["npre"] == 0]
-        # Baseline = steady-state WARM floor of non-preempted active execution.
-        # A low percentile isolates the uncontended warm time: start-up warmup
-        # and any residual contention can only inflate active time above it, so
-        # the median/idle-window are biased high; the low percentile is not.
         clean_active = sorted(x["active"] for x in all_clean)
         clean_gpu = sorted(x["gpu"] for x in all_clean)
-        base_active = pct(clean_active, BASELINE_PCTL) if clean_active \
-            else float("nan")
-        base_gpu = pct(clean_gpu, BASELINE_PCTL) if clean_gpu else float("nan")
 
         pre = [x for x in recs if x["npre"] > 0]
         print(f"\n  [{name}]  releases={len(recs)}  "
               f"non-preempted={len(all_clean)}  preempted={len(pre)}")
-        if all_clean:
+
+        if name in baselines:
+            # Isolated measurement supplied by the user (clean uncontended time).
+            base_active = base_gpu = baselines[name]
+            ctx = (f"  [in-run non-preempted: min {clean_active[0]:.3f}, "
+                   f"median {median(clean_active):.3f}]" if clean_active else "")
+            print(f"    baseline (override) : {base_active:.3f} ms{ctx}")
+        elif clean_active:
+            # Steady-state WARM floor of non-preempted active execution. A low
+            # percentile isolates the uncontended warm time: start-up warmup and
+            # any residual contention only inflate active time above it. NOTE:
+            # unreliable when non-preempted releases are bimodal (a contended
+            # bulk above a rare clean floor) — pass --baseline-ms NAME=MS then.
+            base_active = pct(clean_active, BASELINE_PCTL)
+            base_gpu = pct(clean_gpu, BASELINE_PCTL)
             print(f"    baseline warm floor (p{BASELINE_PCTL} of {len(all_clean)} "
                   f"non-preempted) : {base_active:.3f} ms  "
                   f"(min {clean_active[0]:.3f}, median {median(clean_active):.3f}, "
                   f"max {clean_active[-1]:.3f})")
         else:
-            print("    baseline: (no non-preempted releases)")
+            base_active = base_gpu = float("nan")
+            print("    baseline: (no non-preempted releases — pass "
+                  "--baseline-ms NAME=MS)")
         if not pre:
             continue
         print(f"    gpu_wall when preempted       : "
@@ -305,7 +315,7 @@ def report(events, rels, label, trace_path=None):
             verdict = "ambiguous (mixed regimes or too few samples)"
         print(f"    d(gpu_wall)/d(suspended)      : slope={slope:.3f} "
               f"r={corr:.3f}   [{verdict}]")
-        if all_clean:
+        if base_active == base_active:  # baseline available (not NaN)
             ext_raw = [x["gpu"] - base_gpu for x in pre]
             ext_act = [x["active"] - base_active for x in pre]
             pp_raw = [(x["gpu"] - base_gpu) / x["npre"] for x in pre]
@@ -377,6 +387,14 @@ def main():
                     help="do not prefix dmesg/benchmark with sudo")
     ap.add_argument("--events", help="file containing GCAPS_EV lines to analyse")
     ap.add_argument("--trace", help="benchmark trace CSV to analyse")
+    ap.add_argument("--baseline-ms", action="append", default=[],
+                    metavar="NAME=MS",
+                    help="override a task's baseline active-execution time (ms) "
+                         "with a separate isolated measurement instead of the "
+                         "in-run warm floor, e.g. --baseline-ms mm_victim=27.0 "
+                         "(repeatable, or comma-separated). Use this when a "
+                         "task's non-preempted releases are contended/bimodal "
+                         "and the in-run floor is unreliable.")
     args = ap.parse_args()
 
     if args.run:
@@ -391,10 +409,24 @@ def main():
     if not args.events or not args.trace:
         ap.error("provide --run, or both --events and --trace")
 
+    baselines = {}
+    for item in args.baseline_ms:
+        for part in item.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                ap.error(f"--baseline-ms expects NAME=MS, got '{part}'")
+            name, val = part.split("=", 1)
+            try:
+                baselines[name.strip()] = float(val)
+            except ValueError:
+                ap.error(f"--baseline-ms value not a number: '{part}'")
+
     with open(args.events) as f:
         events = parse_events(f.read())
     rels = load_trace(args.trace)
-    report(events, rels, os.path.basename(args.trace), args.trace)
+    report(events, rels, os.path.basename(args.trace), args.trace, baselines)
 
 
 if __name__ == "__main__":

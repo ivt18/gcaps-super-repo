@@ -252,11 +252,25 @@ python3 scripts/measure_preempt_overhead.py \
   the window is unchanged by suspension (already excludes it), so `raw` is the
   real extension and `active` is a double-subtraction artifact. On AGX Orin the
   measured window includes suspension (slope ≈ 1), so `active` is the figure to
-  read; against the warm-floor baseline it comes out ≈ 0 — GCAPS preemption does
-  not measurably extend a job's active execution (the cost is the per-preemption
+  read; against a clean baseline it comes out ≈ 0 — GCAPS preemption does not
+  measurably extend a job's active execution (the cost is the per-preemption
   overhead from (1) plus the excluded blocking time). A `*_perrelease.csv`
   (gpu_wall, suspended, active, n_preemptions per release) is written next to the
   trace so the correlation can be inspected directly.
+
+  The in-run warm-floor baseline is unreliable when a task's non-preempted
+  releases are themselves contended/bimodal — e.g. the long victim, whose
+  non-preempted releases cluster at a contended ~36 ms with only a minority at
+  the clean ~27 ms floor, so the p20 lands in the contended bulk. Then measure
+  the task's uncontended time in isolation (`workloadSweepGcaps` reports it per
+  workload) and pass it in with `--baseline-ms NAME=MS` (repeatable /
+  comma-separated):
+  ```bash
+  python3 scripts/measure_preempt_overhead.py \
+      --events ... --trace ... --baseline-ms mm_victim=27.0
+  ```
+  The per-task line then shows `baseline (override)` next to the in-run
+  min/median for comparison.
 
 For the simpler whole-distribution ε (all ioctl calls, not preemption-specific),
 [`scripts/analyse_gcaps_overhead.py`](scripts/analyse_gcaps_overhead.py) still
