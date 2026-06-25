@@ -236,10 +236,23 @@ python3 scripts/measure_preempt_overhead.py \
 - **(1)** reports ε distributions; the headline is `preempting add (a real
   preemption)` — the per-preemption scheduling+context-switch cost — plus the
   `resuming remove` (cost of putting the victim back).
-- **(2)** reports, per task: `baseline active exec` (median over non-preempted
-  releases), `active exec when preempted`, the excluded `suspended` (blocking)
-  time, and the **execution-time EXTENSION** (preempted active − baseline) both
-  total and per preemption.
+- **(2)** reports, per task: the `baseline` gpu_wall (median over the
+  preemptor-idle window when one exists, else all non-preempted releases),
+  `gpu_wall when preempted`, the `suspended` (blocking) time, and the
+  **execution-time EXTENSION two ways** — `raw` (= gpu_wall − baseline) and
+  `active` (= (gpu_wall − suspended) − baseline) — each total and per preemption.
+
+  Which one is correct depends on whether this platform's cudaEvent window
+  already includes the suspended time. The line `d(gpu_wall)/d(suspended): slope`
+  decides it per task: **slope ≈ 1** → the GPU window grows with suspension, so
+  `active` is the real extension (use it); **slope ≈ 0** → the window is
+  unchanged by suspension (it already excludes it), so `raw` is the real
+  extension and the `active` figure is a double-subtraction artifact. A long
+  kernel preempted mid-execution typically shows slope ≈ 0 (no measurable active
+  extension — the cost is the per-preemption overhead from (1) plus the excluded
+  blocking time); a short task preempted while still pending shows slope ≈ 1.
+  A `*_perrelease.csv` (gpu_wall, suspended, active, n_preemptions per release)
+  is written next to the trace so the correlation can be inspected directly.
 
 For the simpler whole-distribution ε (all ioctl calls, not preemption-specific),
 [`scripts/analyse_gcaps_overhead.py`](scripts/analyse_gcaps_overhead.py) still

@@ -97,6 +97,21 @@ def fmt(d, unit):
             f"med={d['median']:8.3f} p95={d['p95']:8.3f} max={d['max']:8.3f} {unit}")
 
 
+def linfit(xs, ys):
+    """Least-squares slope and Pearson r of ys on xs."""
+    n = len(xs)
+    if n < 2:
+        return float("nan"), float("nan")
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    syy = sum((y - my) ** 2 for y in ys)
+    slope = sxy / sxx if sxx > 0 else float("nan")
+    r = sxy / (sxx * syy) ** 0.5 if sxx > 0 and syy > 0 else float("nan")
+    return slope, r
+
+
 # --------------------------------------------------------------------------- #
 # event parsing + suspend-interval reconstruction
 # --------------------------------------------------------------------------- #
@@ -185,7 +200,7 @@ def load_trace(path):
 # --------------------------------------------------------------------------- #
 # report
 # --------------------------------------------------------------------------- #
-def report(events, rels, label):
+def report(events, rels, label, trace_path=None):
     print(f"\n===================== {label} =====================")
 
     if not events:
@@ -213,6 +228,13 @@ def report(events, rels, label):
     # ---- (2) execution-time extension when preempted --------------------- #
     susp = reconstruct_suspend_intervals(events)
 
+    # Earliest preemption anywhere in the run: releases finishing before this
+    # ran with the preemptors idle, so they form an uncontaminated baseline
+    # (the microbench's PREEMPTOR_ACTIVATION window). Falls back to all
+    # non-preempted releases when there is no such idle phase (e.g. taskset).
+    first_pre_ts = min((s for ivs in susp.values() for (s, _t) in ivs),
+                       default=None)
+
     # annotate each release with suspended time + #preemptions during its window
     by_name = {}
     for r in rels:
@@ -229,37 +251,80 @@ def report(events, rels, label):
         if active_ms < 0:
             active_ms = 0.0
         by_name.setdefault(r.name, []).append(
-            dict(gpu=r.gpu_ms, susp=susp_ms, active=active_ms, npre=npre))
+            dict(pid=r.pid, begin=r.begin, end=r.end, gpu=r.gpu_ms,
+                 susp=susp_ms, active=active_ms, npre=npre))
 
-    print("\n(2) Execution-time extension when preempted "
-          "(active execution = GPU wall - suspended)")
+    print("\n(2) Execution-time extension when preempted")
     n_preemptions_total = sum(len(v) for v in susp.values())
     print(f"  reconstructed {n_preemptions_total} preemption interval(s) "
           f"across {len(susp)} pid(s)")
+    print("  extension reported two ways (they differ by the suspended time):")
+    print("    raw    = gpu_wall(preempted) - baseline gpu_wall   "
+          "[correct if cudaEvent already EXCLUDES suspension]")
+    print("    active = (gpu_wall - suspended) - baseline         "
+          "[correct if cudaEvent INCLUDES suspension]")
+    print("  the slope d(gpu_wall)/d(suspended) over preempted releases says "
+          "which holds.")
+
     for name in sorted(by_name):
         recs = by_name[name]
-        clean = [x["active"] for x in recs if x["npre"] == 0]
+        all_clean = [x for x in recs if x["npre"] == 0]
+        idle = [x for x in all_clean
+                if first_pre_ts is not None and x["end"] <= first_pre_ts]
+        if idle:
+            base_recs, base_src = idle, "preemptor-idle window"
+        else:
+            base_recs, base_src = all_clean, "all non-preempted (no idle window)"
+        base_gpu = median([x["gpu"] for x in base_recs]) if base_recs \
+            else float("nan")
+        base_active = median([x["active"] for x in base_recs]) if base_recs \
+            else float("nan")
+
         pre = [x for x in recs if x["npre"] > 0]
-        base = median(clean) if clean else float("nan")
         print(f"\n  [{name}]  releases={len(recs)}  "
-              f"non-preempted={len(clean)}  preempted={len(pre)}")
-        print(f"    baseline active exec (median, non-preempted) : "
-              f"{base:8.3f} ms" if clean else
-              "    baseline active exec : (no non-preempted releases — widen "
-              "duration or baseline window)")
+              f"non-preempted={len(all_clean)}  preempted={len(pre)}")
+        print(f"    baseline ({base_src}, n={len(base_recs)}): "
+              f"gpu_wall median = {base_gpu:.3f} ms")
         if not pre:
             continue
-        print(f"    active exec when preempted   : "
-              f"{fmt(describe([x['active'] for x in pre]), 'ms')}")
-        print(f"    suspended (blocking, excluded): "
+        print(f"    gpu_wall when preempted       : "
+              f"{fmt(describe([x['gpu'] for x in pre]), 'ms')}")
+        print(f"    suspended (blocking)          : "
               f"{fmt(describe([x['susp'] for x in pre]), 'ms')}")
-        if clean:
-            ext = [x["active"] - base for x in pre]
-            per_pre = [(x["active"] - base) / x["npre"] for x in pre]
-            print(f"    execution-time EXTENSION     : "
-                  f"{fmt(describe(ext), 'ms')}")
-            print(f"    extension per preemption     : "
-                  f"{fmt(describe(per_pre), 'ms')}")
+        slope, corr = linfit([x["susp"] for x in pre], [x["gpu"] for x in pre])
+        if slope == slope and abs(slope) < 0.3:
+            verdict = "~0 -> gpu_wall EXCLUDES suspension; trust 'raw'"
+        elif slope == slope and slope > 0.7:
+            verdict = "~1 -> gpu_wall INCLUDES suspension; trust 'active'"
+        else:
+            verdict = "ambiguous (mixed regimes or too few samples)"
+        print(f"    d(gpu_wall)/d(suspended)      : slope={slope:.3f} "
+              f"r={corr:.3f}   [{verdict}]")
+        if base_recs:
+            ext_raw = [x["gpu"] - base_gpu for x in pre]
+            ext_act = [x["active"] - base_active for x in pre]
+            pp_raw = [(x["gpu"] - base_gpu) / x["npre"] for x in pre]
+            pp_act = [(x["active"] - base_active) / x["npre"] for x in pre]
+            print(f"    EXTENSION raw                 : {fmt(describe(ext_raw), 'ms')}")
+            print(f"    EXTENSION raw / preemption    : {fmt(describe(pp_raw), 'ms')}")
+            print(f"    EXTENSION active              : {fmt(describe(ext_act), 'ms')}")
+            print(f"    EXTENSION active / preemption : {fmt(describe(pp_act), 'ms')}")
+
+    # per-release dump for offline correlation checking (gpu_wall vs suspended)
+    if trace_path:
+        dump = os.path.splitext(trace_path)[0] + "_perrelease.csv"
+        try:
+            with open(dump, "w") as f:
+                f.write("task_name,pid,seg_begin_ns,seg_done_ns,gpu_wall_ms,"
+                        "suspended_ms,active_ms,n_preemptions\n")
+                for name in sorted(by_name):
+                    for x in by_name[name]:
+                        f.write(f"{name},{x['pid']},{x['begin']},{x['end']},"
+                                f"{x['gpu']:.4f},{x['susp']:.4f},"
+                                f"{x['active']:.4f},{x['npre']}\n")
+            print(f"\nPer-release table written to {dump}")
+        except OSError as e:
+            print(f"\n(could not write per-release dump: {e})")
 
 
 # --------------------------------------------------------------------------- #
@@ -324,7 +389,7 @@ def main():
     with open(args.events) as f:
         events = parse_events(f.read())
     rels = load_trace(args.trace)
-    report(events, rels, os.path.basename(args.trace))
+    report(events, rels, os.path.basename(args.trace), args.trace)
 
 
 if __name__ == "__main__":
