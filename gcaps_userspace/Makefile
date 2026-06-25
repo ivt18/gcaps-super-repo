@@ -81,7 +81,7 @@ $(APP_BUILD_DIR)/projection.o: $(APP_DIR)/projection/projection.cu
 $(APP_BUILD_DIR)/seqworkload.o: $(APP_DIR)/seqworkload/seqworkload.cu
 	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
-all: main tsg_ctxsw workloadSweepGcaps workloadTasksetGcaps
+all: main tsg_ctxsw workloadSweepGcaps workloadTasksetGcaps preemptOverheadGcaps
 # Build
 BUILD_DIR = build
 $(shell mkdir -p $(BUILD_DIR))
@@ -108,6 +108,11 @@ workloadTasksetGcaps: $(BUILD_DIR)/workloadTasksetGcaps.o $(APP_BUILD_DIR)/seqwo
 $(BUILD_DIR)/workloadTasksetGcaps.o: workloadTasksetGcaps.cc
 	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
+preemptOverheadGcaps: $(BUILD_DIR)/preemptOverheadGcaps.o $(APP_BUILD_DIR)/seqworkload.o
+	$(NVCC) $(INCLUDES) $(LDFLAGS) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
+$(BUILD_DIR)/preemptOverheadGcaps.o: preemptOverheadGcaps.cc
+	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+
 .PHONY: clean
 clean:
-	rm -rf $(APP_BUILD_DIR) $(BUILD_DIR) build main tsg_ctxsw workloadSweepGcaps workloadTasksetGcaps
+	rm -rf $(APP_BUILD_DIR) $(BUILD_DIR) build main tsg_ctxsw workloadSweepGcaps workloadTasksetGcaps preemptOverheadGcaps

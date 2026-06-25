@@ -193,10 +193,17 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 	const uint64_t ci_ns     = (uint64_t)td.ci_ms * 1000000ULL;
 	const uint64_t end_ns    = g_sync_start_ns + g_experiment_ns;
 
+	const int my_pid = getpid();
+
 	struct Rec {
 		uint32_t period_idx;
 		double   period_start_ms, cpu_ms, ovh_ms, gpu_ms, resp_ms;
 		bool     missed;
+		/* Absolute CLOCK_MONOTONIC bounds of the GPU segment (0 for the
+		 * CPU-only task). Same clock base as the driver's GCAPS_EV ts=, so
+		 * measure_preempt_overhead.py can intersect driver suspend intervals
+		 * with this window to recover active-execution time. */
+		uint64_t seg_begin_ns, seg_done_ns;
 	};
 	std::vector<Rec> records;
 	records.reserve(g_experiment_ns / period_ns + 4);
@@ -213,11 +220,12 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 		cpu_busy_wait_ns(ci_ns);
 
 		double resp_ms = 0.0, cpu_ms = 0.0, ovh_ms = 0.0, gpu_ms = 0.0;
+		uint64_t seg_begin_ns = 0, seg_done_ns = 0;
 
 		if (wl != nullptr) {
-			const uint64_t seg_begin_ns = host_ns();
+			seg_begin_ns = host_ns();
 			wl->taskCallback(0, 0);            /* one GCAPS GPU segment */
-			const uint64_t seg_done_ns  = host_ns();
+			seg_done_ns  = host_ns();
 
 			cpu_ms  = (double)(seg_begin_ns - period_start_ns) / 1.0e6;
 			gpu_ms  = (double)wl->lastGpuMs();
@@ -240,6 +248,8 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 			rec.gpu_ms   = gpu_ms;
 			rec.resp_ms  = resp_ms;
 			rec.missed   = (resp_ms > (double)td.ti_ms);
+			rec.seg_begin_ns = seg_begin_ns;
+			rec.seg_done_ns  = seg_done_ns;
 			records.push_back(rec);
 		}
 		first_period = false;
@@ -257,10 +267,13 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 	if (!f) { fprintf(stderr, "[task %s] could not open %s\n", td.name, path);
 	          return; }
 	for (const Rec& r : records)
-		fprintf(f, "%d,%s,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%d\n",
+		fprintf(f, "%d,%s,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%d,%d,%llu,%llu\n",
 		        task_idx, td.name, r.period_idx, r.period_start_ms,
 		        r.cpu_ms, r.ovh_ms, r.gpu_ms, r.resp_ms,
-		        (double)td.ti_ms, (int)r.missed);
+		        (double)td.ti_ms, (int)r.missed,
+		        my_pid,
+		        (unsigned long long)r.seg_begin_ns,
+		        (unsigned long long)r.seg_done_ns);
 	fclose(f);
 }
 
@@ -289,7 +302,7 @@ static void merge_and_summarise(const char* mode_tag)
 	if (!tr) { fprintf(stderr, "could not open %s\n", tracePath); return; }
 	fprintf(tr, "task_id,task_name,period_idx,period_start_ms,cpu_phase_ms,"
 	            "sched_preempt_overhead_ms,gpu_exec_ms,response_ms,"
-	            "deadline_ms,missed\n");
+	            "deadline_ms,missed,pid,seg_begin_ns,seg_done_ns\n");
 
 	std::vector<double> resp[NUM_TASKS];
 

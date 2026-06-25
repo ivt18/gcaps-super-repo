@@ -168,6 +168,83 @@ This loads whichever of the four CSVs exist and writes `sweep_response.pdf`,
   silently select a reduced-core/low-clock profile.
 
 
+## Measuring Preemption Overhead
+This measures two things in a scenario where tasks are registered at different
+SCHED_FIFO priorities and a higher-priority job's GPU segment arrives while a
+lower-priority one is running (i.e. a real GCAPS preemption):
+
+1. **Scheduling + context-switch / preemption overhead** — the cost of actually
+   performing the preemption (runlist reload + GPU-side switch), measured inside
+   the driver ioctl critical section (GCAPS ε).
+2. **Execution-time extension of a preempted job** — by how much a job's *active*
+   GPU execution grows when it is preempted. The time the job sits **suspended**
+   (blocked while a higher-priority job runs) is **excluded** — only actively
+   executing time is counted, then compared against the job's non-preempted
+   baseline.
+
+### Driver instrumentation
+This needs the **extended driver patch** (rebuild + redeploy the `nvgpu` module —
+see [`gcaps_driver_patch`](../gcaps_driver_patch/readme.md)). On top of the
+original `process <pid> elapsed time: <us>` line, `nvgpu_ioctl_runlist_update_rt_prio`
+now emits one structured record per ioctl:
+```
+GCAPS_EV ts=<ns> cpid=<pid> prio=<n> add=<0|1> rlupd=<0|1> elapsed_us=<eps> preempted=<pid|-1> resumed=<pid|-1>
+```
+- `ts` — `ktime_get()` ns (same clock base as userspace `CLOCK_MONOTONIC`).
+- `add` — 1 entering a GPU segment, 0 leaving it.
+- `rlupd` — 1 if a real runlist reload happened (separates scheduling work from
+  no-op bookkeeping calls; explains the bimodal ε distribution).
+- `elapsed_us` — duration of the critical section (GCAPS ε).
+- `preempted` — pid evicted to *pending* by this higher-priority add (a real
+  preemption), or −1. `resumed` — pid re-admitted to the runlist on a remove.
+
+The `preempted`/`resumed` pairs (matched by pid) reconstruct each job's
+**suspended intervals**, which is what makes (2) possible.
+
+### Build
+```bash
+make preemptOverheadGcaps          # the controlled victim+preemptor microbench
+make workloadTasksetGcaps          # the realistic 7-task taskset (now also logs pid + seg timestamps)
+```
+
+### Run + analyse
+Same prerequisites as the taskset above (`nvpmodel -m 0 && jetson_clocks`,
+`sched_rt_runtime_us=-1`, always `-s 1`). The script clears `dmesg`, runs the
+benchmark under GCAPS (`-i 1 -s 1`), captures the `GCAPS_EV` lines and joins them
+with the benchmark trace. Needs `sudo` (SCHED_FIFO + reading the kernel log):
+```bash
+# controlled microbenchmark — cleanest per-preemption numbers
+sudo python3 scripts/measure_preempt_overhead.py --run microbench -d 30
+
+# realistic mixed taskset
+sudo python3 scripts/measure_preempt_overhead.py --run taskset -d 30
+```
+The microbench is a long-segment low-priority **victim** (matmul) preempted by a
+high-priority and a mid-priority **preemptor** (matmul / histogram) at three
+distinct SCHED_FIFO priorities; a baseline window at the start runs the victim
+uncontended so there are clean non-preempted samples to compare against. Tune
+sizes with `--extra "-N 4096 -P 1024"` (victim / preemptor matmul side).
+
+To analyse data captured separately (no device needed):
+```bash
+python3 scripts/measure_preempt_overhead.py \
+    --events results/workloadBench/preempt_gcaps_events.log \
+    --trace  results/workloadBench/preempt_gcaps_trace.csv
+```
+
+### Interpreting the output
+- **(1)** reports ε distributions; the headline is `preempting add (a real
+  preemption)` — the per-preemption scheduling+context-switch cost — plus the
+  `resuming remove` (cost of putting the victim back).
+- **(2)** reports, per task: `baseline active exec` (median over non-preempted
+  releases), `active exec when preempted`, the excluded `suspended` (blocking)
+  time, and the **execution-time EXTENSION** (preempted active − baseline) both
+  total and per preemption.
+
+For the simpler whole-distribution ε (all ioctl calls, not preemption-specific),
+[`scripts/analyse_gcaps_overhead.py`](scripts/analyse_gcaps_overhead.py) still
+works and now also parses the `GCAPS_EV` `elapsed_us` field.
+
 ## References
 [1] Yidi Wang, Cong Liu, Daniel Wong, and Hyoseung Kim. GCAPS: GPU Context-Aware Preemptive Priority-based Scheduling for Real-Time Tasks. In Euromicro Conference on Real-Time Systems (ECRTS), 2024.
 [2] Björn B Brandenburg. The FMLP+: An asymptotically optimal real-time locking protocol for suspension-aware analysis. In 2014 26th Euromicro Conference on Real-Time Systems, pages 61–71. IEEE, 2014.

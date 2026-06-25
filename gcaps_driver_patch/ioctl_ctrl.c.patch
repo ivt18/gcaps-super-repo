@@ -9,7 +9,7 @@
  #include <nvgpu/pmu/therm.h>
  #include <nvgpu/power_features/pg.h>
 \ No newline at end of file
-@@ -2222,7 +2223,270 @@
+@@ -2222,7 +2223,296 @@
  
  	return err;
  }
@@ -111,7 +111,14 @@
 +	int rt_prio_next = 0;
 +	/* when the caller requests to be removed, the next tsgs with highest rt prio */
 +	unsigned long *tsgs_next = nvgpu_kzalloc(g, sched->bitmap_size);
-+		
++
++	/* GCAPS measurement instrumentation (added): describe the state
++	 * transition this ioctl performed so userspace can attribute the
++	 * scheduling/preemption overhead and reconstruct suspend intervals. */
++	bool rl_updated = false;       /* did an actual runlist reload happen */
++	pid_t preempted_pid = -1;      /* rt task evicted to pending by this add */
++	pid_t resumed_pid = -1;        /* task put back into the runlist on remove */
++
 +	char except_proc_names[][32] = {"Xorg", "gnome-shell"};
 +
 +	*new_tsg_in_rl = 0;
@@ -178,6 +185,9 @@
 +			/* do not allow interleaved execution if tasks are of the same rt_prio, use FIFO in this case */
 +			/* the caller's rt_prio is higher than the running one of the same #op_type, add it to the runlists, and REMOVE the current running ones (add to pending) */
 +			if (task_caller->rt_priority > rt_task_in_rl->rt_prio) {
++				/* the running rt task (if any) is about to be evicted to
++				 * pending by this higher-priority add: record the victim. */
++				preempted_pid = rt_task_in_rl->pid;
 +				/* the caller's rt_prio is higher than the running one of the same #op_type, add it to the runlists, and REMOVE the current running ones (add to pending) */
 +				// pr_info("------ rt task pid %d add request granted\n", cpid);
 +					*rl_ctrl->tsg_pending |= *rl_ctrl->tsg_running;
@@ -207,6 +217,7 @@
 +				}
 +			}else {
 +				task_next = pid_task(find_vpid(pid_next), PIDTYPE_PID);
++				resumed_pid = pid_next; /* this task is resumed back into the runlist */
 +				/* found the next rt task of #op_type, add ONLY this task to runlists */
 +				*rl_ctrl->tsg_running = *tsgs_next;
 +				*rl_ctrl->tsg_pending &= ~(*tsgs_next);
@@ -252,6 +263,7 @@
 +
 +	/* update runlist */
 +	if (*new_tsg_in_rl != *rl_ctrl->curr_tsgs_in_rl) {
++		rl_updated = true; /* a real runlist reload (incl. any GPU preemption) */
 +		for (i = 0; i < f->num_channels; i++) {
 +			struct nvgpu_tsg *tsg = &f->tsg[i];
 +			struct nvgpu_channel *ch;
@@ -273,7 +285,21 @@
 +	stop_time = ktime_get();
 +	elapsed_time = ktime_to_ns(ktime_sub(stop_time, start_time)) / 1000; // us
 +	pr_info("process %d elapsed time: %lld", cpid, elapsed_time);
-+	rt_mutex_unlock(&sched->cs_lock); 
++	/* GCAPS_EV: one structured record per ioctl for measure_preempt_overhead.py.
++	 *   ts          - ktime (ns), same clock base as userspace CLOCK_MONOTONIC
++	 *   prio        - caller SCHED_FIFO rt_priority (1..99), -1 if unknown
++	 *   add         - 1 = entering a GPU segment, 0 = leaving it
++	 *   rlupd       - 1 = an actual runlist reload happened (scheduling work +
++	 *                 any GPU-side preemption), 0 = bookkeeping only
++	 *   elapsed_us  - duration of the critical section (GCAPS epsilon)
++	 *   preempted   - pid evicted to pending by this add (a preemption), or -1
++	 *   resumed     - pid re-admitted to the runlist by this remove, or -1 */
++	pr_info("GCAPS_EV ts=%lld cpid=%d prio=%d add=%d rlupd=%d elapsed_us=%lld preempted=%d resumed=%d",
++		ktime_to_ns(stop_time), cpid,
++		task_caller ? (int)task_caller->rt_priority : -1,
++		add_req ? 1 : 0, rl_updated ? 1 : 0, elapsed_time,
++		preempted_pid, resumed_pid);
++	rt_mutex_unlock(&sched->cs_lock);
 +	return err;
 +}
 +

@@ -2,6 +2,14 @@
 
 This folder includes the implementation of GCAPS approach in Tegra driver.
 
+> **Measurement instrumentation.** `ioctl_ctrl.c.patch` additionally emits a
+> structured `GCAPS_EV ts=... add=... rlupd=... elapsed_us=... preempted=...
+> resumed=...` line per runlist-update ioctl (alongside the original
+> `process <pid> elapsed time:` line). This is what
+> [`gcaps_userspace/scripts/measure_preempt_overhead.py`](../gcaps_userspace/readme.md#measuring-preemption-overhead)
+> uses to attribute per-preemption overhead and reconstruct suspend intervals.
+> Rebuild and redeploy `nvgpu.ko` (steps below) to pick it up.
+
 ## Test Environments
 - Nvidia Jetson Xavier NX
 - L4T R35.2.1 with Jetpack 5.0.2
