@@ -460,7 +460,9 @@ def plot_epsilon(events: list[dict], pid2name: dict[int, str], out_dir: str,
                  names_order: list[str] | None = None) -> None:
     """epsilon.pdf — left: histogram of elapsed_us split into the no-op and
     runlist-reload modes (the bimodal structure the paper's Fig. 12 shows);
-    right: per-task epsilon box plot for the GPU tasks."""
+    right: per-task epsilon box plot over the runlist-reload events only
+    (rlupd=1) — the no-op IOCTL-only calls are excluded so the box reflects the
+    real reload cost (α+θ) rather than the bimodal mix."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.4))
 
     allv = np.array([e['eps_us'] for e in events], float)
@@ -473,16 +475,24 @@ def plot_epsilon(events: list[dict], pid2name: dict[int, str], out_dir: str,
     ax1.set_xlabel('ε = runlist-update overhead (µs)')
     ax1.set_ylabel('frequency')
     ax1.set_title('GCAPS ε distribution (Def. 2)')
-    ax1.legend(fontsize=8)
+    ax1.legend(fontsize=8, loc='upper right')
     ax1.grid(axis='y', alpha=0.3)
+    # Stats box in the upper-left (the bimodal gap leaves it empty) so it does
+    # not collide with the legend in the upper-right.
     stats = (f'n={len(allv)}\nmin={allv.min():.0f}\nmed={np.median(allv):.0f}'
              f'\nmean={allv.mean():.0f}\nmax={allv.max():.0f}  µs')
-    ax1.text(0.97, 0.95, stats, transform=ax1.transAxes, ha='right', va='top',
+    ax1.text(0.03, 0.97, stats, transform=ax1.transAxes, ha='left', va='top',
              fontsize=9, family='monospace',
              bbox=dict(boxstyle='round', fc='white', ec='#cccccc', alpha=0.9))
 
+    # Per-task box over runlist-reload events only (rlupd=1): the no-op IOCTL
+    # calls (~tens of µs) are excluded so the box shows the real reload cost,
+    # not the bimodal mix that otherwise inflates the spread of mid-priority
+    # tasks whose requests are sometimes granted (reload) and sometimes not.
     per: dict[str, list[int]] = defaultdict(list)
     for e in events:
+        if not e['rlupd']:
+            continue
         nm = pid2name.get(e['cpid'])
         if nm is not None:
             per[nm].append(e['eps_us'])
@@ -500,11 +510,12 @@ def plot_epsilon(events: list[dict], pid2name: dict[int, str], out_dir: str,
                  'workloadTasksetGcaps for the pid column)', ha='center',
                  va='center', transform=ax2.transAxes, fontsize=9)
     ax2.set_ylabel('ε (µs)')
-    ax2.set_title('Per-task ε (GPU tasks)')
+    ax2.set_title('Per-task ε — runlist reload only (rlupd=1)')
     ax2.grid(axis='y', alpha=0.3)
 
     fig.suptitle('Driver-measured GCAPS runlist-update overhead  (ε = α + θ)')
-    fig.tight_layout()
+    # Reserve headroom so the suptitle clears both subplot titles.
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     path = os.path.join(out_dir, 'epsilon.pdf')
     fig.savefig(path, bbox_inches='tight')
     plt.close(fig)
