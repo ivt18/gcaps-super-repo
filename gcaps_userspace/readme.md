@@ -142,6 +142,15 @@ This loads whichever of the four CSVs exist and writes `sweep_response.pdf`,
 `sweep_overhead.pdf`, `taskset_mort.pdf`, `taskset_breakdown.pdf`,
 `taskset_overhead.pdf`, and `taskset_gantt.pdf` into the results directory.
 
+If a captured `taskset_gcaps_events.log` is also present (written by
+`measure_preempt_overhead.py --run taskset`), the plotter additionally draws
+`epsilon.pdf` — the driver-measured GCAPS ε (runlist-update overhead, α+θ): an
+`elapsed_us` histogram split into the no-op vs runlist-reload modes (à la the
+paper's Fig. 12) plus a per-task ε box plot — and, attributing ε per release
+(the add+remove ioctls inside each GPU segment), splits the red "overhead" band
+into ε (red) + other latency (grey) in the breakdown and Gantt. Without the log,
+those fall back to the single overhead band and `epsilon.pdf` is skipped.
+
 ### Troubleshooting the taskset
 - **`-i 1` hangs but `-i 0` works.** This was the best-effort-task deadlock (see
   [`best-effort-tasks-bug.md`](../best-effort-tasks-bug.md)), now avoided by

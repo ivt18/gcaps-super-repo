@@ -26,19 +26,31 @@ Console output:
     GCAPS vs TSG baseline
   - Per-task taskset summary (MORT / mean / misses), GCAPS vs TSG
 
+The driver-measured GCAPS ε (runlist-update overhead, α+θ — Def. 2 of the paper)
+is read from the captured GCAPS_EV kernel log (taskset_gcaps_events.log, written
+by measure_preempt_overhead.py --run taskset) when present. It drives a dedicated
+epsilon.pdf and, attributed per release (the add+remove ioctls inside each GPU
+segment), splits the red "overhead" band into ε (red) + other latency (grey) in
+the breakdown and Gantt. Absent the log, those fall back to the single overhead
+band and epsilon.pdf is skipped.
+
 Figures written to --results-dir:
   sweep_response.pdf      — mean response per configuration, GCAPS vs TSG
                             (one panel per workload type, log y)
   sweep_overhead.pdf      — per-config sched+preempt overhead: response delta
                             (GCAPS - TSG) and GCAPS overhead
+  epsilon.pdf             — driver-measured ε: elapsed_us histogram (no-op vs
+                            runlist-reload modes, à la the paper's Fig. 12) and
+                            per-task ε box plot  [needs taskset_gcaps_events.log]
   taskset_mort.pdf        — MORT and mean response per task, GCAPS vs TSG
-  taskset_breakdown.pdf   — stacked mean cpu / overhead / gpu components per task
+  taskset_breakdown.pdf   — stacked mean cpu / overhead / gpu per task; overhead
+                            split into ε + other when the event log is present
   taskset_overhead.pdf    — sched+preempt-overhead distribution box plots,
                             GPU tasks
   taskset_gantt.pdf       — stacked GCAPS-vs-TSG execution Gantt over the
                             window [--gantt-start, +--gantt-duration]; each
-                            period tiled CPU (green) | overhead (red) |
-                            GPU (purple); width scaled to the window length
+                            period tiled CPU (green) | overhead (red, split into
+                            ε + other when available) | GPU (purple)
 
 Usage:
     python3 scripts/plot_workload_bench.py \\
@@ -50,6 +62,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 from collections import defaultdict
 
 import matplotlib
@@ -66,6 +79,19 @@ TSG_COLOR = '#ff7f0e'
 CPU_COLOR = '#2ca02c'       # green  — CPU phase
 OVERHEAD_COLOR = '#d62728'  # red    — scheduling + preemption overhead
 GPU_COLOR = '#9467bd'       # purple — GPU execution
+
+# Overhead is split into the driver-measured GCAPS epsilon (the runlist-update
+# ioctl cost, alpha+theta) and the remaining latency (kernel launch + GPU-side
+# scheduling/preemption delay) when the GCAPS_EV event log is available.
+EPS_COLOR = '#d62728'       # red    — measured epsilon (runlist update)
+OTHER_OVH_COLOR = '#9e9e9e' # grey   — other overhead (launch + GPU-side delay)
+
+# One structured driver record per runlist-update ioctl (see the driver patch):
+#   GCAPS_EV ts=<ns> cpid=<pid> prio=<n> add=<0|1> rlupd=<0|1> \
+#            elapsed_us=<eps> preempted=<pid|-1> resumed=<pid|-1>
+GCAPS_EV_RE = re.compile(
+    r'GCAPS_EV\s+ts=(\d+)\s+cpid=(-?\d+)\s+prio=(-?\d+)\s+add=(\d+)\s+'
+    r'rlupd=(\d+)\s+elapsed_us=(-?\d+)\s+preempted=(-?\d+)\s+resumed=(-?\d+)')
 
 # Figure-width scaling for the (very wide) taskset Gantt, in inches per second
 # of trace time (override with --gantt-inches-per-sec).
@@ -102,12 +128,14 @@ def load_sweep(path: str) -> dict[str, dict[str, np.ndarray]] | None:
 
 
 def load_taskset(path: str) -> dict[str, dict[str, np.ndarray]] | None:
-    """task_name -> {start, cpu, overhead, gpu, response, deadline, missed}."""
+    """task_name -> {start, cpu, overhead, gpu, response, deadline, missed,
+    and (if the trace carries them) pid, seg_begin, seg_done}."""
     if not os.path.isfile(path):
         print(f'  [skip] {path} not found')
         return None
     rows = defaultdict(lambda: defaultdict(list))
     order: list[str] = []
+    have_pid = False
     with open(path) as f:
         for r in csv.DictReader(f):
             t = r['task_name']
@@ -120,7 +148,75 @@ def load_taskset(path: str) -> dict[str, dict[str, np.ndarray]] | None:
             rows[t]['response'].append(float(r['response_ms']))
             rows[t]['deadline'].append(float(r['deadline_ms']))
             rows[t]['missed'].append(int(r['missed']))
+            # pid / absolute segment bounds (added for epsilon attribution);
+            # older traces without these columns degrade gracefully.
+            if 'pid' in r and r['pid'] != '':
+                have_pid = True
+                rows[t]['pid'].append(int(r['pid']))
+                rows[t]['seg_begin'].append(float(r['seg_begin_ns']))
+                rows[t]['seg_done'].append(float(r['seg_done_ns']))
+    if not have_pid:
+        print(f'  [note] {os.path.basename(path)} has no pid/seg columns — '
+              'epsilon attribution unavailable (rebuild workloadTasksetGcaps)')
     return {t: {k: np.array(v) for k, v in rows[t].items()} for t in order}
+
+
+def load_events(path: str) -> list[dict] | None:
+    """Parse GCAPS_EV lines from a captured kernel-log file ->
+    list of {ts, cpid, add, rlupd, eps_us, preempted}. None if absent/empty."""
+    if not os.path.isfile(path):
+        print(f'  [skip] {path} not found')
+        return None
+    evs: list[dict] = []
+    with open(path) as f:
+        for line in f:
+            m = GCAPS_EV_RE.search(line)
+            if m:
+                evs.append({'ts': int(m.group(1)), 'cpid': int(m.group(2)),
+                            'add': int(m.group(4)), 'rlupd': int(m.group(5)),
+                            'eps_us': int(m.group(6)),
+                            'preempted': int(m.group(7))})
+    if not evs:
+        print(f'  [skip] no GCAPS_EV lines in {path}')
+        return None
+    return evs
+
+
+def pid_to_name(taskset: dict[str, dict[str, np.ndarray]]) -> dict[int, str]:
+    """Map each task's pid -> task_name (GPU tasks that issued ioctls)."""
+    m: dict[int, str] = {}
+    for t, d in taskset.items():
+        if 'pid' in d and len(d['pid']):
+            m[int(d['pid'][0])] = t
+    return m
+
+
+def attribute_epsilon(taskset: dict[str, dict[str, np.ndarray]],
+                      events: list[dict]) -> dict[str, np.ndarray] | None:
+    """Per-release measured epsilon (ms): for each release of each task, sum the
+    elapsed_us of the GCAPS_EV events with that task's pid whose ts falls inside
+    the release's GPU segment [seg_begin, seg_done] (normally the add + remove
+    ioctls = 2*epsilon). Returns {task -> array aligned with the release arrays}
+    or None if the trace lacks pid/segment bounds."""
+    if not any('pid' in d for d in taskset.values()):
+        return None
+    by_pid: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for ev in events:
+        by_pid[ev['cpid']].append((ev['ts'], ev['eps_us']))
+    for pid in by_pid:
+        by_pid[pid].sort()
+
+    out: dict[str, np.ndarray] = {}
+    for t, d in taskset.items():
+        n = len(d['start'])
+        eps = np.zeros(n)
+        if 'pid' in d and len(d['pid']):
+            evs = by_pid.get(int(d['pid'][0]), [])
+            for i in range(n):
+                b, e = d['seg_begin'][i], d['seg_done'][i]
+                eps[i] = sum(us for ts, us in evs if b <= ts <= e) / 1.0e3
+        out[t] = eps
+    return out
 
 
 # ── Sweep analysis ──────────────────────────────────────────────────────────
@@ -262,7 +358,8 @@ def plot_taskset_mort(gcaps, tsg, out_dir: str) -> None:
     print(f'  wrote {path}')
 
 
-def plot_taskset_breakdown(gcaps, tsg, out_dir: str) -> None:
+def plot_taskset_breakdown(gcaps, tsg, out_dir: str,
+                           eps: dict[str, np.ndarray] | None = None) -> None:
     names = list(gcaps.keys()) if gcaps else list(tsg.keys())
     x = np.arange(len(names))
     width = 0.38
@@ -276,10 +373,23 @@ def plot_taskset_breakdown(gcaps, tsg, out_dir: str) -> None:
         gpu = np.array([np.mean(data[t]['gpu']) for t in names])
         ax.bar(x + off, cpu, width, color=CPU_COLOR, alpha=alpha,
                label=f'{tag}: cpu phase')
-        ax.bar(x + off, overhead, width, bottom=cpu, color=OVERHEAD_COLOR,
-               alpha=alpha, label=f'{tag}: sched+preempt overhead')
-        ax.bar(x + off, gpu, width, bottom=cpu + overhead, color=GPU_COLOR,
-               alpha=alpha, label=f'{tag}: gpu exec')
+        if tag == 'gcaps' and eps is not None:
+            # Split overhead into measured ε (runlist update) and the remainder;
+            # ε clipped to the slack so the stack still sums to the response.
+            e = np.array([np.mean(eps[t]) if t in eps else 0.0 for t in names])
+            e = np.minimum(e, overhead)
+            other = np.clip(overhead - e, 0.0, None)
+            ax.bar(x + off, e, width, bottom=cpu, color=EPS_COLOR, alpha=alpha,
+                   label=f'{tag}: ε (runlist update)')
+            ax.bar(x + off, other, width, bottom=cpu + e, color=OTHER_OVH_COLOR,
+                   alpha=alpha, label=f'{tag}: other overhead')
+            ax.bar(x + off, gpu, width, bottom=cpu + e + other, color=GPU_COLOR,
+                   alpha=alpha, label=f'{tag}: gpu exec')
+        else:
+            ax.bar(x + off, overhead, width, bottom=cpu, color=OVERHEAD_COLOR,
+                   alpha=alpha, label=f'{tag}: sched+preempt overhead')
+            ax.bar(x + off, gpu, width, bottom=cpu + overhead, color=GPU_COLOR,
+                   alpha=alpha, label=f'{tag}: gpu exec')
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('mean time (ms)')
@@ -326,7 +436,83 @@ def plot_taskset_overhead(gcaps, tsg, out_dir: str) -> None:
     print(f'  wrote {path}')
 
 
-def _draw_gantt_panel(ax, data, names: list[str], title: str) -> None:
+# ── Epsilon (driver-measured runlist-update overhead) ───────────────────────
+
+def epsilon_summary(events: list[dict]) -> None:
+    print('\n── GCAPS epsilon — runlist-update overhead (Def. 2, µs) ───────')
+
+    def line(tag: str, a: list[int]) -> None:
+        if a:
+            arr = np.array(a, float)
+            print(f'  {tag:<24} n={len(arr):<5d} min={arr.min():7.0f}'
+                  f' med={np.median(arr):7.0f} mean={arr.mean():7.0f}'
+                  f' p95={np.percentile(arr, 95):7.0f} max={arr.max():7.0f}')
+        else:
+            print(f'  {tag:<24} (none)')
+
+    line('all ioctls', [e['eps_us'] for e in events])
+    line('runlist reload (rlupd=1)', [e['eps_us'] for e in events if e['rlupd']])
+    line('no-op (rlupd=0)', [e['eps_us'] for e in events if not e['rlupd']])
+    line('preemptions', [e['eps_us'] for e in events if e['preempted'] > 0])
+
+
+def plot_epsilon(events: list[dict], pid2name: dict[int, str], out_dir: str,
+                 names_order: list[str] | None = None) -> None:
+    """epsilon.pdf — left: histogram of elapsed_us split into the no-op and
+    runlist-reload modes (the bimodal structure the paper's Fig. 12 shows);
+    right: per-task epsilon box plot for the GPU tasks."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.4))
+
+    allv = np.array([e['eps_us'] for e in events], float)
+    eps_reload = [e['eps_us'] for e in events if e['rlupd']]
+    eps_noop = [e['eps_us'] for e in events if not e['rlupd']]
+    bins = np.linspace(0.0, max(float(allv.max()), 1.0), 40)
+    ax1.hist([eps_reload, eps_noop], bins=bins, stacked=True,
+             color=[EPS_COLOR, OTHER_OVH_COLOR],
+             label=['runlist reload (rlupd=1)', 'no-op (rlupd=0)'])
+    ax1.set_xlabel('ε = runlist-update overhead (µs)')
+    ax1.set_ylabel('frequency')
+    ax1.set_title('GCAPS ε distribution (Def. 2)')
+    ax1.legend(fontsize=8)
+    ax1.grid(axis='y', alpha=0.3)
+    stats = (f'n={len(allv)}\nmin={allv.min():.0f}\nmed={np.median(allv):.0f}'
+             f'\nmean={allv.mean():.0f}\nmax={allv.max():.0f}  µs')
+    ax1.text(0.97, 0.95, stats, transform=ax1.transAxes, ha='right', va='top',
+             fontsize=9, family='monospace',
+             bbox=dict(boxstyle='round', fc='white', ec='#cccccc', alpha=0.9))
+
+    per: dict[str, list[int]] = defaultdict(list)
+    for e in events:
+        nm = pid2name.get(e['cpid'])
+        if nm is not None:
+            per[nm].append(e['eps_us'])
+    names = [n for n in (names_order or list(per.keys())) if n in per]
+    if names:
+        bp = ax2.boxplot([per[n] for n in names], showfliers=True,
+                         patch_artist=True, flierprops={'markersize': 2})
+        for patch in bp['boxes']:
+            patch.set_facecolor(EPS_COLOR)
+            patch.set_alpha(0.6)
+        ax2.set_xticks(np.arange(1, len(names) + 1))
+        ax2.set_xticklabels(names, rotation=45, ha='right', fontsize=8)
+    else:
+        ax2.text(0.5, 0.5, 'no per-task pid mapping\n(rebuild '
+                 'workloadTasksetGcaps for the pid column)', ha='center',
+                 va='center', transform=ax2.transAxes, fontsize=9)
+    ax2.set_ylabel('ε (µs)')
+    ax2.set_title('Per-task ε (GPU tasks)')
+    ax2.grid(axis='y', alpha=0.3)
+
+    fig.suptitle('Driver-measured GCAPS runlist-update overhead  (ε = α + θ)')
+    fig.tight_layout()
+    path = os.path.join(out_dir, 'epsilon.pdf')
+    fig.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  wrote {path}')
+
+
+def _draw_gantt_panel(ax, data, names: list[str], title: str,
+                      eps: dict[str, np.ndarray] | None = None) -> None:
     """Draw one Gantt panel: one row per task, each period tiled as
     CPU (green) | overhead (red) | GPU (purple) broken_barh segments."""
     bar_h = 0.72
@@ -339,17 +525,27 @@ def _draw_gantt_panel(ax, data, names: list[str], title: str) -> None:
         overhead = np.clip(d['overhead'], 0.0, None)
         gpu = np.clip(d['gpu'], 0.0, None)
 
-        cpu_seg = list(zip(start, cpu))
-        o_seg = list(zip(start + cpu, overhead))
-        g_seg = list(zip(start + cpu + overhead, gpu))
-
         y0 = row - bar_h / 2
-        ax.broken_barh(cpu_seg, (y0, bar_h), facecolors=CPU_COLOR,
-                       edgecolors='none')
-        ax.broken_barh(o_seg, (y0, bar_h), facecolors=OVERHEAD_COLOR,
-                       edgecolors='none')
-        ax.broken_barh(g_seg, (y0, bar_h), facecolors=GPU_COLOR,
-                       edgecolors='none')
+        ax.broken_barh(list(zip(start, cpu)), (y0, bar_h),
+                       facecolors=CPU_COLOR, edgecolors='none')
+
+        eps_arr = eps.get(t) if eps is not None else None
+        if eps_arr is not None and len(eps_arr) == len(overhead):
+            # Split the overhead band into the measured ε (runlist update) and
+            # the remaining latency (launch + GPU-side delay), ε clipped to the
+            # measured slack so the tiles still sum to the response.
+            e = np.minimum(np.clip(eps_arr, 0.0, None), overhead)
+            other = np.clip(overhead - e, 0.0, None)
+            ax.broken_barh(list(zip(start + cpu, e)), (y0, bar_h),
+                           facecolors=EPS_COLOR, edgecolors='none')
+            ax.broken_barh(list(zip(start + cpu + e, other)), (y0, bar_h),
+                           facecolors=OTHER_OVH_COLOR, edgecolors='none')
+        else:
+            ax.broken_barh(list(zip(start + cpu, overhead)), (y0, bar_h),
+                           facecolors=OVERHEAD_COLOR, edgecolors='none')
+
+        ax.broken_barh(list(zip(start + cpu + overhead, gpu)), (y0, bar_h),
+                       facecolors=GPU_COLOR, edgecolors='none')
 
         # Deadlines: downward triangle at release + relative deadline,
         # red+larger when the release missed.
@@ -376,7 +572,8 @@ def _draw_gantt_panel(ax, data, names: list[str], title: str) -> None:
 def plot_taskset_gantt(gcaps, tsg, out_dir: str,
                        inches_per_sec: float = GANTT_INCHES_PER_S,
                        start_s: float = 0.0,
-                       duration_s: float = 10.0) -> None:
+                       duration_s: float = 10.0,
+                       eps: dict[str, np.ndarray] | None = None) -> None:
     """Stacked GCAPS-vs-TSG Gantt over the window [start_s, start_s +
     duration_s], shared time axis.
 
@@ -408,13 +605,22 @@ def plot_taskset_gantt(gcaps, tsg, out_dir: str,
     axes = axes[:, 0]
 
     for ax, (d, lbl) in zip(axes, panels):
-        _draw_gantt_panel(ax, d, names, lbl)
+        # ε is only defined for the GCAPS (ioctl) panel; the TSG baseline issues
+        # no runlist-update ioctls, so its overhead band stays unsplit.
+        _draw_gantt_panel(ax, d, names, lbl, eps=eps if lbl == 'GCAPS' else None)
     axes[-1].set_xlabel('time since experiment start (ms)', fontsize=13)
     axes[-1].set_xlim(left=start_ms, right=end_ms)
 
+    ovh_handles = (
+        [mpatches.Patch(facecolor=EPS_COLOR, label='ε: runlist update (GCAPS)'),
+         mpatches.Patch(facecolor=OTHER_OVH_COLOR,
+                        label='other overhead (launch + GPU-side)')]
+        if eps is not None else
+        [mpatches.Patch(facecolor=OVERHEAD_COLOR, label='sched+preempt overhead')]
+    )
     legend_handles = [
         mpatches.Patch(facecolor=CPU_COLOR, label='CPU phase'),
-        mpatches.Patch(facecolor=OVERHEAD_COLOR, label='sched+preempt overhead'),
+        *ovh_handles,
         mpatches.Patch(facecolor=GPU_COLOR, label='GPU exec'),
         plt.Line2D([0], [0], marker='v', color='#555555', linestyle='none',
                    markersize=6, label='deadline'),
@@ -422,7 +628,7 @@ def plot_taskset_gantt(gcaps, tsg, out_dir: str,
                    linestyle='none', markersize=10, label='missed deadline'),
     ]
     axes[0].legend(handles=legend_handles, fontsize=12, loc='upper right',
-                   framealpha=0.9, edgecolor='#cccccc', ncol=5)
+                   framealpha=0.9, edgecolor='#cccccc', ncol=len(legend_handles))
     fig.suptitle('Taskset execution Gantt — CPU | overhead | GPU per period  '
                  f'(window {start_s:g}–{start_s + duration_s:g} s)',
                  fontsize=16, fontweight='bold')
@@ -472,11 +678,25 @@ def main() -> int:
 
     if ts_gcaps or ts_tsg:
         taskset_summary(ts_gcaps, ts_tsg)
+        # Driver-measured epsilon from the captured GCAPS_EV kernel log (written
+        # by measure_preempt_overhead.py --run taskset). Optional: absent log ->
+        # the ε figure/overlay are skipped and the other plots are unchanged.
+        print('Loading GCAPS_EV event log…')
+        ts_events = load_events(os.path.join(out, 'taskset_gcaps_events.log'))
+        ts_eps = None
+        if ts_events and ts_gcaps:
+            epsilon_summary(ts_events)
+            plot_epsilon(ts_events, pid_to_name(ts_gcaps), out,
+                         list(ts_gcaps.keys()))
+            ts_eps = attribute_epsilon(ts_gcaps, ts_events)
+            if ts_eps is None:
+                print('  [note] trace lacks pid/seg columns — ε overlay on '
+                      'breakdown/Gantt skipped (ε figure still drawn)')
         plot_taskset_mort(ts_gcaps, ts_tsg, out)
-        plot_taskset_breakdown(ts_gcaps, ts_tsg, out)
+        plot_taskset_breakdown(ts_gcaps, ts_tsg, out, ts_eps)
         plot_taskset_overhead(ts_gcaps, ts_tsg, out)
         plot_taskset_gantt(ts_gcaps, ts_tsg, out, args.gantt_inches_per_sec,
-                           args.gantt_start, args.gantt_duration)
+                           args.gantt_start, args.gantt_duration, ts_eps)
 
     if not any((sweep_gcaps, sweep_tsg, ts_gcaps, ts_tsg)):
         print('No input CSVs found — run the bench binaries first.')
