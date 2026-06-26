@@ -48,11 +48,18 @@
  * that. The synchronized periodic run only begins after every context is warm,
  * so there is a ~(NUM_TASKS+1) s one-time warm-up before the timed window.
  *
- * Usage:  workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S] [-k N]
- *         (defaults: -i 0 -s 0 -b 0 -d 30, all GPU tasks)
+ * Usage:  workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S]
+ *                              [-k N] [-S SCALE]
+ *         (defaults: -i 0 -s 0 -b 0 -d 30 -S 1.0, all GPU tasks)
  *         -k N : activate only the first N GPU tasks (CPU-only task always
  *                runs) — for bisecting how many concurrent GPU contexts the
  *                GCAPS elevation path tolerates before deadlocking.
+ *         -S SCALE : multiply every GPU task's period (= deadline) by SCALE,
+ *                leaving C_i / G_i and the CPU-only task's period unchanged, so
+ *                SCALE < 1 raises GPU utilization by x1/SCALE (mirrors
+ *                singleTaskSched's workloadTasksetBench -s SCALE). Higher
+ *                utilization means more preemption churn and a higher chance of
+ *                hitting the runlist-cache-desync deadlock (use a shorter -d).
  * Output (-i 1 -> gcaps, else tsg):
  *   results/workloadBench/taskset_{gcaps,tsg}_trace.csv
  *   results/workloadBench/taskset_{gcaps,tsg}_results.csv
@@ -141,6 +148,10 @@ static void sleep_until_abs_ns(uint64_t target_ns)
 static uint64_t g_init_start_ns   = 0;   // epoch for the staggered per-task init
 static uint64_t g_sync_start_ns   = 0;   // synchronized periodic-loop start
 static uint64_t g_experiment_ns   = 0;
+// Period (= deadline) multiplier for the GPU tasks only — leaves C_i / G_i (and
+// the CPU-only task's period) unchanged, so SCALE < 1 raises GPU utilization by
+// x1/SCALE. Mirrors singleTaskSched's workloadTasksetBench -s SCALE. Set by -S.
+static double   g_period_scale    = 1.0;
 
 // Per-task init is staggered by this much so the 7 CUDA contexts are created
 // and first touch the GPU one at a time. Creating/initialising all contexts
@@ -189,7 +200,11 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 		wl->recordPriority(td.fifo_priority);
 	}
 
-	const uint64_t period_ns = (uint64_t)td.ti_ms * 1000000ULL;
+	/* Scale GPU-task periods (= deadlines) only; C_i and the CPU-only task are
+	 * left unchanged so SCALE<1 tightens GPU contention. */
+	const double   ti_ms_eff = td.is_gpu ? (double)td.ti_ms * g_period_scale
+	                                     : (double)td.ti_ms;
+	const uint64_t period_ns = (uint64_t)(ti_ms_eff * 1.0e6);
 	const uint64_t ci_ns     = (uint64_t)td.ci_ms * 1000000ULL;
 	const uint64_t end_ns    = g_sync_start_ns + g_experiment_ns;
 
@@ -247,7 +262,7 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 			rec.ovh_ms   = ovh_ms;
 			rec.gpu_ms   = gpu_ms;
 			rec.resp_ms  = resp_ms;
-			rec.missed   = (resp_ms > (double)td.ti_ms);
+			rec.missed   = (resp_ms > ti_ms_eff);
 			rec.seg_begin_ns = seg_begin_ns;
 			rec.seg_done_ns  = seg_done_ns;
 			records.push_back(rec);
@@ -270,7 +285,7 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 		fprintf(f, "%d,%s,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%d,%d,%llu,%llu\n",
 		        task_idx, td.name, r.period_idx, r.period_start_ms,
 		        r.cpu_ms, r.ovh_ms, r.gpu_ms, r.resp_ms,
-		        (double)td.ti_ms, (int)r.missed,
+		        ti_ms_eff, (int)r.missed,
 		        my_pid,
 		        (unsigned long long)r.seg_begin_ns,
 		        (unsigned long long)r.seg_done_ns);
@@ -373,18 +388,23 @@ int main(int argc, char** argv)
 	uint64_t duration_s = 30;
 	int gpu_limit = -1;   /* -1 = all GPU tasks; else activate only first N */
 	int opt;
-	while ((opt = getopt(argc, argv, "i:s:b:d:k:")) != EOF) {
+	while ((opt = getopt(argc, argv, "i:s:b:d:k:S:")) != EOF) {
 		switch (opt) {
 			case 'i': ioctl_enabled = atoi(optarg); break;
 			case 's': suspension    = atoi(optarg); break;
 			case 'b': sync_mode     = atoi(optarg); break;
 			case 'd': duration_s    = strtoull(optarg, nullptr, 10); break;
 			case 'k': gpu_limit     = atoi(optarg); break;
+			case 'S': g_period_scale = atof(optarg); break;
 			default:  fprintf(stderr, "bad option\n"); return 1;
 		}
 	}
 	if (sync_mode && ioctl_enabled) {
 		fprintf(stderr, "IOCTL and sync mode are mutually exclusive\n");
+		return 1;
+	}
+	if (g_period_scale <= 0.0) {
+		fprintf(stderr, "scale (-S) must be > 0\n");
 		return 1;
 	}
 	const char* mode_tag = ioctl_enabled ? "gcaps" : "tsg";
@@ -415,6 +435,9 @@ int main(int argc, char** argv)
 	       (double)(g_sync_start_ns - host_ns()) / 1.0e9);
 	if (gpu_limit >= 0)
 		printf("  [GPU tasks capped at %d]", gpu_limit);
+	if (g_period_scale != 1.0)
+		printf("  [GPU periods x%.3g -> util x%.3g]",
+		       g_period_scale, 1.0 / g_period_scale);
 	printf("\n");
 
 	/* Remove stale per-task trace fragments so a capped run (fewer tasks) does

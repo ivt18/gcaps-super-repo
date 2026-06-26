@@ -101,13 +101,24 @@ workloads as the per-period GPU segments, one forked process per task. Writes
 `results/workloadBench/taskset_{gcaps,tsg}_{trace,results}.csv`. Real-time
 tasks need `sudo` for SCHED_FIFO.
 ```bash
-sudo ./workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S] [-k N]
-# defaults: -i 0 -s 0 -b 0 -d 30, all GPU tasks
-sudo ./workloadTasksetGcaps -i 1 -s 1 -d 30   # GCAPS (all 6 GPU tasks)
-sudo ./workloadTasksetGcaps -i 0 -s 1 -d 30   # TSG baseline
+sudo ./workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S] [-k N] [-S SCALE]
+# defaults: -i 0 -s 0 -b 0 -d 30 -S 1.0, all GPU tasks
+sudo ./workloadTasksetGcaps -i 1 -s 1 -d 30          # GCAPS (all 6 GPU tasks)
+sudo ./workloadTasksetGcaps -i 0 -s 1 -d 30          # TSG baseline
+sudo ./workloadTasksetGcaps -i 1 -s 1 -d 15 -S 0.5   # GCAPS at ~2x GPU utilization
 ```
 `-k N` activates only the first N GPU tasks (the CPU-only task always runs);
 useful for diagnostics/bisection, not normally needed.
+
+`-S SCALE` multiplies every GPU task's period (= deadline) by `SCALE`, leaving
+`C_i` / `G_i` and the CPU-only task's period unchanged — so `SCALE < 1` raises
+GPU utilization by ×1/`SCALE` (mirrors singleTaskSched's `workloadTasksetBench
+-s SCALE`). Use it to push the taskset into contention so the GCAPS-vs-TSG
+difference becomes visible in the plots. **Caveat:** higher utilization means
+more preemption churn and a substantially higher chance of hitting the
+[runlist-cache-desync deadlock](../runlist-cache-desync-bug.md) — pair a small
+`SCALE` with a shorter `-d`, and expect that some runs may hang and need a
+reboot (see Troubleshooting).
 
 **All tasks run as real-time (no best-effort tasks).** GCAPS Table 4's two
 best-effort tasks (`mm_2048`, `hist_4M`) are run here at the two lowest
@@ -140,7 +151,11 @@ python3 scripts/plot_workload_bench.py [--results-dir results/workloadBench]
 ```
 This loads whichever of the four CSVs exist and writes `sweep_response.pdf`,
 `sweep_overhead.pdf`, `taskset_mort.pdf`, `taskset_breakdown.pdf`,
-`taskset_overhead.pdf`, and `taskset_gantt.pdf` into the results directory.
+`taskset_response_overhead.pdf`, and `taskset_gantt.pdf` into the results
+directory. `taskset_response_overhead.pdf` is the per-task distribution of
+`response − cpu − gpu` = ε + kernel launch/sync + GPU-side queuing/priority
+interference (the last dominates for low-priority tasks); it is the end-to-end
+counterpart to the isolated driver-measured ε in `epsilon.pdf`.
 
 If a captured `taskset_gcaps_events.log` is also present (written by
 `measure_preempt_overhead.py --run taskset`), the plotter additionally draws

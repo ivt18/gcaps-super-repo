@@ -45,8 +45,10 @@ Figures written to --results-dir:
   taskset_mort.pdf        — MORT and mean response per task, GCAPS vs TSG
   taskset_breakdown.pdf   — stacked mean cpu / overhead / gpu per task; overhead
                             split into ε + other when the event log is present
-  taskset_overhead.pdf    — sched+preempt-overhead distribution box plots,
-                            GPU tasks
+  taskset_response_overhead.pdf
+                          — per-task box plots of the response overhead
+                            (response − cpu − gpu = ε + launch + queuing/
+                            interference), GPU tasks, GCAPS vs TSG
   taskset_gantt.pdf       — stacked GCAPS-vs-TSG execution Gantt over the
                             window [--gantt-start, +--gantt-duration]; each
                             period tiled CPU (green) | overhead (red, split into
@@ -404,10 +406,16 @@ def plot_taskset_breakdown(gcaps, tsg, out_dir: str,
     print(f'  wrote {path}')
 
 
-def plot_taskset_overhead(gcaps, tsg, out_dir: str) -> None:
+def plot_taskset_response_overhead(gcaps, tsg, out_dir: str) -> None:
+    """Per-task distribution of the response-time overhead = response - cpu_phase
+    - gpu_exec, i.e. everything in the period outside the task's own CPU busy-wait
+    and its measured on-GPU window. It bundles three things: the GCAPS runlist
+    -update ioctls (≈2·ε — small at this scale, see epsilon.pdf), kernel-launch /
+    sync latency, and GPU-side queuing / priority interference (the part that
+    blows up for low-priority tasks waiting behind higher-priority ones)."""
     src = gcaps or tsg
     names = [t for t in src if np.any(src[t]['gpu'] > 0)]  # GPU tasks only
-    fig, ax = plt.subplots(figsize=(11, 4.2))
+    fig, ax = plt.subplots(figsize=(11, 4.6))
     data, labels, colors = [], [], []
     for t in names:
         if gcaps:
@@ -425,12 +433,24 @@ def plot_taskset_overhead(gcaps, tsg, out_dir: str) -> None:
     for patch, c in zip(bp['boxes'], colors):
         patch.set_facecolor(c)
         patch.set_alpha(0.6)
-    ax.set_ylabel('sched + preempt overhead (ms)')
-    ax.set_title('Scheduling + preemption overhead distribution per GPU task')
+    ax.set_ylabel('response overhead (ms)')
+    ax.set_title('Per-task response overhead   (response − CPU phase − GPU exec)',
+                 fontsize=12, pad=26)
+    ax.text(0.5, 1.005,
+            '= GCAPS ε (≈2× runlist-update ioctl, small here — see epsilon.pdf)  '
+            '+  kernel launch/sync  +  GPU-side queuing / priority interference '
+            '(dominant for low-priority tasks)',
+            transform=ax.transAxes, ha='center', va='bottom', fontsize=8,
+            color='#555555')
+    ax.legend(handles=[mpatches.Patch(facecolor=GCAPS_COLOR, alpha=0.6,
+                                      label='GCAPS (ioctl)'),
+                       mpatches.Patch(facecolor=TSG_COLOR, alpha=0.6,
+                                      label='TSG baseline')],
+              fontsize=8, loc='upper left')
     ax.tick_params(axis='x', labelsize=7)
     ax.grid(axis='y', alpha=0.3)
     fig.tight_layout()
-    path = os.path.join(out_dir, 'taskset_overhead.pdf')
+    path = os.path.join(out_dir, 'taskset_response_overhead.pdf')
     fig.savefig(path, bbox_inches='tight')
     plt.close(fig)
     print(f'  wrote {path}')
@@ -705,7 +725,7 @@ def main() -> int:
                       'breakdown/Gantt skipped (ε figure still drawn)')
         plot_taskset_mort(ts_gcaps, ts_tsg, out)
         plot_taskset_breakdown(ts_gcaps, ts_tsg, out, ts_eps)
-        plot_taskset_overhead(ts_gcaps, ts_tsg, out)
+        plot_taskset_response_overhead(ts_gcaps, ts_tsg, out)
         plot_taskset_gantt(ts_gcaps, ts_tsg, out, args.gantt_inches_per_sec,
                            args.gantt_start, args.gantt_duration, ts_eps)
 
