@@ -49,8 +49,16 @@
  * preemptors idle, guaranteeing clean non-preempted samples for the comparison.
  *
  * Usage: preemptOverheadGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S]
- *                             [-N victim_matmul] [-P preemptor_matmul]
- *        (defaults: -i 0 -s 0 -b 0 -d 30 -N 4096 -P 1024)
+ *                             [-M] [-N victim_size] [-P preemptor_size]
+ *        (defaults: -i 0 -s 0 -b 0 -d 30; -N 4096 -P 1024 without -M,
+ *         -N 512 -P 64 with -M)
+ *        -M : memory-intensive variant — every task becomes a large-footprint
+ *             histogram (victim 512Mi elements = 2 GiB, preemptorA 64Mi,
+ *             preemptorB 128Mi; ~2.75 GiB total, sized for the AGX Orin), to
+ *             probe whether preemption costs grow under memory pressure
+ *             (cache/TLB thrash from the preempting task).  -N / -P are then
+ *             read as Mi ELEMENTS for the victim / preemptorA histograms
+ *             instead of matmul dimensions.
  *        Run with sudo for SCHED_FIFO; needs sched_rt_runtime_us=-1 and -s 1
  *        (blocking sync) for the same reasons as workloadTasksetGcaps — see the
  *        userspace readme.
@@ -94,7 +102,10 @@ struct PreemptTaskDef {
 	bool         is_preemptor;   /* idle during the baseline window */
 };
 
-/* p1 of the two matmul tasks is overridden by -N / -P at runtime. */
+/* p1 of the victim / preemptorA tasks is overridden by -N / -P at runtime.
+ * -M swaps all three workloads for large-footprint histograms (names/types/
+ * sizes patched in main before fork); roles, periods, cores and priorities
+ * stay identical, so the scenario structure is unchanged. */
 static PreemptTaskDef TASKS[NUM_TASKS] = {
 	{"victim",     "mm_victim",  SeqWlType::MATMUL,    4096,     0,  80, 1, 2, false},
 	{"preemptorA", "mm_preA",    SeqWlType::MATMUL,    1024,     0,  17, 2, 5, true },
@@ -231,11 +242,11 @@ int main(int argc, char** argv)
 {
 	setvbuf(stdout, nullptr, _IONBF, 0);
 
-	int ioctl_enabled = 0, suspension = 0, sync_mode = 0;
+	int ioctl_enabled = 0, suspension = 0, sync_mode = 0, mem_mode = 0;
 	uint64_t duration_s = 30;
-	unsigned int victim_n = 4096, preemptor_n = 1024;
+	unsigned int victim_n = 0, preemptor_n = 0;   /* 0 = per-mode default */
 	int opt;
-	while ((opt = getopt(argc, argv, "i:s:b:d:N:P:")) != EOF) {
+	while ((opt = getopt(argc, argv, "i:s:b:d:N:P:M")) != EOF) {
 		switch (opt) {
 			case 'i': ioctl_enabled = atoi(optarg); break;
 			case 's': suspension    = atoi(optarg); break;
@@ -243,6 +254,7 @@ int main(int argc, char** argv)
 			case 'd': duration_s    = strtoull(optarg, nullptr, 10); break;
 			case 'N': victim_n      = (unsigned int)atoi(optarg); break;
 			case 'P': preemptor_n   = (unsigned int)atoi(optarg); break;
+			case 'M': mem_mode      = 1; break;
 			default:  fprintf(stderr, "bad option\n"); return 1;
 		}
 	}
@@ -250,8 +262,25 @@ int main(int argc, char** argv)
 		fprintf(stderr, "IOCTL and sync mode are mutually exclusive\n");
 		return 1;
 	}
-	TASKS[0].wlP1 = victim_n;      /* victim matmul size */
-	TASKS[1].wlP1 = preemptor_n;   /* preemptorA matmul size */
+	if (mem_mode) {
+		/* Memory-intensive variant: every task a large-footprint histogram.
+		 * Defaults sized for the AGX Orin (hist_64M ≈ 2.9 ms, hist_128M ≈
+		 * 7.1 ms measured): victim 512Mi el (2 GiB, ~33 ms < 80 ms period),
+		 * preA 64Mi (2.9 < 17), preB 128Mi (7.1 < 29) → U ≈ 0.82.  Keep each
+		 * baseline < period when overriding -N / -P (Mi elements). */
+		if (!victim_n)    victim_n    = 512;
+		if (!preemptor_n) preemptor_n = 64;
+		TASKS[0].name   = "hist_victim";
+		TASKS[0].wlType = SeqWlType::HISTOGRAM;
+		TASKS[0].wlP1   = victim_n << 20;
+		TASKS[1].name   = "hist_preA";
+		TASKS[1].wlType = SeqWlType::HISTOGRAM;
+		TASKS[1].wlP1   = preemptor_n << 20;
+		TASKS[2].wlP1   = 128u << 20;   /* preB: hist 8M -> 128M */
+	} else {
+		TASKS[0].wlP1 = victim_n    ? victim_n    : 4096;  /* victim matmul */
+		TASKS[1].wlP1 = preemptor_n ? preemptor_n : 1024;  /* preA matmul */
+	}
 	const char* mode_tag = ioctl_enabled ? "gcaps" : "tsg";
 
 	int fd = open("/dev/nvgpu/igpu0/ctrl", O_RDWR);
@@ -269,10 +298,20 @@ int main(int argc, char** argv)
 	                + (uint64_t)NUM_TASKS * INIT_STAGGER_NS
 	                + POSTINIT_MARGIN_NS;
 
-	printf("Preempt microbench: mode=%s, duration=%llus, victim_mm=%u, "
-	       "preemptor_mm=%u, baseline window=%.1fs, experiment starts in %.1fs\n",
+	char vdesc[32], pdesc[32];
+	if (mem_mode) {
+		snprintf(vdesc, sizeof(vdesc), "hist %uM", victim_n);
+		snprintf(pdesc, sizeof(pdesc), "hist %uM", preemptor_n);
+	} else {
+		snprintf(vdesc, sizeof(vdesc), "matmul %u", TASKS[0].wlP1);
+		snprintf(pdesc, sizeof(pdesc), "matmul %u", TASKS[1].wlP1);
+	}
+	printf("Preempt microbench: mode=%s, duration=%llus, victim=%s, "
+	       "preemptorA=%s, preemptorB=hist %uM, baseline window=%.1fs, "
+	       "experiment starts in %.1fs\n",
 	       ioctl_enabled ? "GCAPS-ioctl" : "TSG-default",
-	       (unsigned long long)duration_s, victim_n, preemptor_n,
+	       (unsigned long long)duration_s, vdesc, pdesc,
+	       TASKS[2].wlP1 >> 20,
 	       (double)PREEMPTOR_ACTIVATION_NS / 1.0e9,
 	       (double)(g_sync_start_ns - host_ns()) / 1.0e9);
 

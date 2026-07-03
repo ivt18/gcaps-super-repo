@@ -23,6 +23,10 @@ The cost of a preemption is the ~0.6 ms scheduling/context-switch overhead plus
 the suspension (blocking) time — and suspension is response-time, not
 execution-time, so it is excluded by construction.
 
+Both numbers are confirmed by a
+[scaled-up run](#scaled-up-run-victim-matmul-2560) with a ~2× longer victim
+segment (matmul 2560): ε moved by ~3 µs, extension stayed ≈ 0.
+
 ## Setup
 
 - **Hardware / OS:** Jetson AGX Orin (`ga10b`), L4T R35.6.0 / JetPack 5.1.4, GCAPS-patched
@@ -59,20 +63,19 @@ is also instrumented and can be measured the same way.
 ## How to reproduce
 
 ```bash
-# 1. clean uncontended victim baseline (matmul 2048, in isolation)
+# 1. isolated baselines — now covers every taskset workload + a -N 2560 victim
 sudo ./workloadSweepGcaps -i 1 -s 1 -n 100 -w 20
-awk -F, '$1=="matmul_2048"{print $5}' results/workloadBench/sweep_gcaps.csv \
+awk -F, '$1=="matmul_2560"{print $5}' results/workloadBench/sweep_gcaps.csv \
   | sort -n | awk '{a[NR]=$1} END{print "median="a[int((NR+1)/2)]}'
-# -> ~27.075 ms (n=100, range 27.064-27.086)
 
-# 2. run the microbench under GCAPS and analyse, anchoring the victim to the
-#    isolated baseline
+# 2. scaled-up microbench (longer victim/preemptor, still under the 80/17 ms periods)
 sudo python3 scripts/measure_preempt_overhead.py --run microbench -d 30 \
-     --extra "-N 2048 -P 1024"
+     --extra "-N 2560 -P 1024"
 python3 scripts/measure_preempt_overhead.py \
     --events results/workloadBench/preempt_gcaps_events.log \
     --trace  results/workloadBench/preempt_gcaps_trace.csv \
-    --baseline-ms mm_victim=27.075
+    --baseline-ms mm_victim=53.375
+
 ```
 
 ## Detailed results
@@ -104,6 +107,46 @@ Victim (`mm_victim`), baseline = isolated **27.075 ms**, 52 preempted releases:
 
 `active = gpu_wall − suspended ≈ 27.1 ms ≈ baseline 27.075` → extension ≈ 0.
 `hist_preB` likewise ≈ 0 (per-preemption median −0.28 ms, p95 +0.57 ms).
+
+## Scaled-up run (victim matmul 2560)
+
+A second run of the same process (the commands in *How to reproduce* above)
+with a ~2× longer victim, to check the headline numbers are not artifacts of
+the original sizes: victim matmul **2560** (~53.4 ms segment vs ~27 ms, same
+80 ms period), isolated baseline `matmul_2560` = **53.375 ms** from the
+extended sweep (which now includes matmul 2560 and MLP 1024x8 so every
+taskset/microbench workload has an isolated twin). The preemptor stays at 1024:
+GPU utilization is then ≈ 0.87, still schedulable — enlarging both
+(`-N 2560 -P 1536`) would exceed U = 1 and overload the scenario (see
+*Tuning matters*).
+
+Results (30 s run; 315 real preemptions, 51 preempted victim releases):
+
+| quantity | 2048 run | 2560 run |
+|---|---:|---:|
+| preempting add ε (median / p95 / worst) | 601 / 631 / 659 µs (n=171) | 604 / 637 / 658 µs (n=315) |
+| resuming remove ε (median / p95 / max) | 631 / 660 / 671 µs (n=209) | 636 / 663 / 686 µs (n=360) |
+| bookkeeping only, `rlupd=0` (median) | 13 µs | 21 µs |
+| victim extension, active, per release (median / p95) | −0.11 / +0.38 ms | −0.19 / +0.66 ms |
+| victim extension, active, per preemption (median / p95) | −0.03 / +0.16 ms | −0.035 / +0.13 ms |
+
+Takeaways:
+
+- **ε is independent of segment size.** Doubling the victim's segment length
+  (and nearly doubling the preemption count) moved the ε distribution by ~3 µs —
+  the ~0.6 ms is a fixed runlist-reload cost, not proportional to what runs.
+- **Active extension ≈ 0 confirmed.** The `d(gpu_wall)/d(suspended)` regime
+  slope came out ambiguous here (0.605, r = 0.75 — the suspensions cluster in a
+  narrow 14–24 ms band, so the regression is poorly conditioned), but the
+  accounting identity resolves it: raw extension median 18.68 ms ≈ suspended
+  median 18.98 ms, i.e. the wall-time inflation is entirely the suspension
+  itself, so `active ≈ baseline` and the *active* numbers are the right ones.
+- The victim's in-run non-preempted floor was again bimodal (median 71.9 ms,
+  clean min 53.40 ms ≈ isolated 53.375 ms), re-confirming the isolated
+  `--baseline-ms` anchor is mandatory — the unanchored analysis reports a
+  meaningless −18 ms "extension".
+- The 30 s run completed without hitting the runlist-cache-desync deadlock,
+  consistent with longer segments → fewer ioctls/s → lower hit rate.
 
 ## Methodology notes
 

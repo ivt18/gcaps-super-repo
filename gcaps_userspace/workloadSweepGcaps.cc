@@ -73,15 +73,16 @@ static double p95(std::vector<double> v)
 }
 
 /* Configuration set of buildSweepWorkloads() in workloads.cuh, plus matmul
- * 2560 and MLP 1024x8 (absent from the source sweep) so every workload of the
- * taskset benchmark — and a scaled-up preemptOverheadGcaps victim — has an
- * isolated-baseline twin here (for measure_preempt_overhead.py --baseline-ms). */
+ * 2560, MLP 1024x8 and histogram 512M (absent from the source sweep) so every
+ * workload of the taskset benchmark — and the scaled-up / memory-intensive
+ * (-M) preemptOverheadGcaps victims — has an isolated-baseline twin here (for
+ * measure_preempt_overhead.py --baseline-ms). */
 static std::vector<SweepConfig> buildSweepConfigs()
 {
 	std::vector<SweepConfig> c;
 	for (int sz : {512, 1024, 2048, 2560, 4096})
 		c.push_back({SeqWlType::MATMUL, (unsigned)sz, 0});
-	for (unsigned sz : {4u << 20, 16u << 20, 64u << 20, 128u << 20})
+	for (unsigned sz : {4u << 20, 16u << 20, 64u << 20, 128u << 20, 512u << 20})
 		c.push_back({SeqWlType::HISTOGRAM, sz, 0});
 	for (int img : {1024, 2048, 4096})
 		for (int kw : {3, 7, 15})
