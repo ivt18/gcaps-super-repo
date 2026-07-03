@@ -25,6 +25,8 @@ Console output:
   - Per-configuration sweep summary (mean / p95 response, overhead),
     GCAPS vs TSG baseline
   - Per-task taskset summary (MORT / mean / misses), GCAPS vs TSG
+  - Per-task worst-case GPU exec time C_i = max(gpu_exec) and the resulting
+    taskset GPU utilization U = Σ C_i/T_i, one table per series
 
 The driver-measured GCAPS ε (runlist-update overhead, α+θ — Def. 2 of the paper)
 is read from the captured GCAPS_EV kernel log (taskset_gcaps_events.log, written
@@ -52,7 +54,9 @@ Figures written to --results-dir:
   taskset_gantt.pdf       — stacked GCAPS-vs-TSG execution Gantt over the
                             window [--gantt-start, +--gantt-duration]; each
                             period tiled CPU (green) | overhead (red, split into
-                            ε + other when available) | GPU (purple)
+                            ε + other when available) | GPU (purple); rows
+                            ordered by the trace's fifo_priority (highest on
+                            top, CPU-only task last)
 
 Usage:
     python3 scripts/plot_workload_bench.py \\
@@ -131,11 +135,14 @@ def load_sweep(path: str) -> dict[str, dict[str, np.ndarray]] | None:
 
 def load_taskset(path: str) -> dict[str, dict[str, np.ndarray]] | None:
     """task_name -> {start, cpu, overhead, gpu, response, deadline, missed,
-    and (if the trace carries them) pid, seg_begin, seg_done}."""
+    and (if the trace carries them) pid, seg_begin, seg_done, plus
+    fifo_priority (int, the task's assigned SCHED_FIFO priority; None for
+    older traces without the column)."""
     if not os.path.isfile(path):
         print(f'  [skip] {path} not found')
         return None
     rows = defaultdict(lambda: defaultdict(list))
+    prio: dict[str, int | None] = {}
     order: list[str] = []
     have_pid = False
     with open(path) as f:
@@ -143,6 +150,8 @@ def load_taskset(path: str) -> dict[str, dict[str, np.ndarray]] | None:
             t = r['task_name']
             if t not in rows:
                 order.append(t)
+                pv = r.get('fifo_priority')
+                prio[t] = int(pv) if pv not in (None, '') else None
             rows[t]['start'].append(float(r['period_start_ms']))
             rows[t]['cpu'].append(float(r['cpu_phase_ms']))
             rows[t]['overhead'].append(float(r['sched_preempt_overhead_ms']))
@@ -160,7 +169,9 @@ def load_taskset(path: str) -> dict[str, dict[str, np.ndarray]] | None:
     if not have_pid:
         print(f'  [note] {os.path.basename(path)} has no pid/seg columns — '
               'epsilon attribution unavailable (rebuild workloadTasksetGcaps)')
-    return {t: {k: np.array(v) for k, v in rows[t].items()} for t in order}
+    return {t: {**{k: np.array(v) for k, v in rows[t].items()},
+                'fifo_priority': prio.get(t)}
+            for t in order}
 
 
 def load_events(path: str) -> list[dict] | None:
@@ -241,8 +252,8 @@ def sweep_summary(gcaps, tsg) -> None:
 
 
 def plot_sweep_response(gcaps, tsg, out_dir: str) -> None:
-    types = ['matmul', 'histogram', 'convolution']
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+    types = ['matmul', 'histogram', 'convolution', 'mlp']
+    fig, axes = plt.subplots(1, 4, figsize=(19, 4.2))
     src = gcaps or tsg
     for ax, wtype in zip(axes, types):
         names = [wl for wl, d in src.items() if d['type'] == wtype]
@@ -332,6 +343,25 @@ def taskset_summary(gcaps, tsg) -> None:
               f' {bmo:>9.3f} {bme:>9.3f} {bmi:>8.1f}%')
 
 
+def taskset_utilization(gcaps, tsg) -> None:
+    """Per-task worst-case GPU execution time and resulting GPU utilization."""
+    print('\n── Taskset GPU utilization (worst-case GPU exec time) ─────────')
+    for data, label in ((gcaps, 'GCAPS'), (tsg, 'TSG baseline')):
+        if not data:
+            continue
+        print(f'\n{label}:')
+        print(f'{"Task":<16} {"T (ms)":>9} {"C_gpu WCET (ms)":>16}'
+              f' {"U_i = C/T":>11}')
+        total = 0.0
+        for t in data:
+            T = float(data[t]['deadline'][0])
+            C = float(np.max(data[t]['gpu']))
+            u = C / T if T > 0 else float('nan')
+            total += u
+            print(f'{t:<16} {T:>9.3f} {C:>16.3f} {u:>11.4f}')
+        print(f'{"":<16} {"":>9} {"total U_gpu":>16} {total:>11.4f}')
+
+
 def plot_taskset_mort(gcaps, tsg, out_dir: str) -> None:
     names = list(gcaps.keys()) if gcaps else list(tsg.keys())
     x = np.arange(len(names))
@@ -344,15 +374,22 @@ def plot_taskset_mort(gcaps, tsg, out_dir: str) -> None:
         if tsg:
             ax.bar(x + width / 2, [fn(tsg[t]['response']) for t in names],
                    width, label='TSG baseline', color=TSG_COLOR)
-        if gcaps:
-            ax.plot(x, [gcaps[t]['deadline'][0] for t in names], 'k_',
-                    markersize=18, label='deadline')
+        dl_src = gcaps or tsg
+        if dl_src:
+            # Per-task deadline (T_i = D_i): a black tick spanning the bar pair.
+            for j, t in enumerate(names):
+                d = float(dl_src[t]['deadline'][0])
+                ax.hlines(d, x[j] - width, x[j] + width, color='k',
+                          linewidth=1.6, zorder=5)
         ax.set_xticks(x)
         ax.set_xticklabels(names, rotation=45, ha='right', fontsize=8)
         ax.set_ylabel('response time (ms)')
         ax.set_title(f'{title} response time per task')
         ax.grid(axis='y', alpha=0.3)
-        ax.legend(fontsize=8)
+        handles, _ = ax.get_legend_handles_labels()
+        handles.append(plt.Line2D([0], [0], color='k', linewidth=1.6,
+                                  label='deadline (T$_i$ = D$_i$)'))
+        ax.legend(handles=handles, fontsize=8)
     fig.tight_layout()
     path = os.path.join(out_dir, 'taskset_mort.pdf')
     fig.savefig(path, bbox_inches='tight')
@@ -543,9 +580,17 @@ def plot_epsilon(events: list[dict], pid2name: dict[int, str], out_dir: str,
 
 
 def _draw_gantt_panel(ax, data, names: list[str], title: str,
+                      labels: list[str] | None = None,
+                      start_ms: float | None = None,
+                      end_ms: float | None = None,
                       eps: dict[str, np.ndarray] | None = None) -> None:
     """Draw one Gantt panel: one row per task, each period tiled as
-    CPU (green) | overhead (red) | GPU (purple) broken_barh segments."""
+    CPU (green) | overhead (red) | GPU (purple) broken_barh segments.
+
+    When [start_ms, end_ms] is given, periods that fall entirely outside the
+    window are skipped — visually identical to the caller's xlim clip, but it
+    avoids drawing (and rasterising) the whole trace, which dominates render
+    time for long runs / many tasks."""
     bar_h = 0.72
     for row, t in enumerate(names):
         d = data.get(t)
@@ -556,8 +601,17 @@ def _draw_gantt_panel(ax, data, names: list[str], title: str,
         overhead = np.clip(d['overhead'], 0.0, None)
         gpu = np.clip(d['gpu'], 0.0, None)
 
+        keep = np.ones(len(start), dtype=bool)
+        if start_ms is not None:
+            span = np.maximum(d['response'], d['deadline'])
+            keep = (start <= end_ms) & (start + span >= start_ms)
+        s = start[keep]
+        c = cpu[keep]
+        o = overhead[keep]
+        g = gpu[keep]
+
         y0 = row - bar_h / 2
-        ax.broken_barh(list(zip(start, cpu)), (y0, bar_h),
+        ax.broken_barh(list(zip(s, c)), (y0, bar_h),
                        facecolors=CPU_COLOR, edgecolors='none')
 
         eps_arr = eps.get(t) if eps is not None else None
@@ -565,39 +619,75 @@ def _draw_gantt_panel(ax, data, names: list[str], title: str,
             # Split the overhead band into the measured ε (runlist update) and
             # the remaining latency (launch + GPU-side delay), ε clipped to the
             # measured slack so the tiles still sum to the response.
-            e = np.minimum(np.clip(eps_arr, 0.0, None), overhead)
-            other = np.clip(overhead - e, 0.0, None)
-            ax.broken_barh(list(zip(start + cpu, e)), (y0, bar_h),
+            e = np.minimum(np.clip(eps_arr, 0.0, None), overhead)[keep]
+            other = np.clip(o - e, 0.0, None)
+            ax.broken_barh(list(zip(s + c, e)), (y0, bar_h),
                            facecolors=EPS_COLOR, edgecolors='none')
-            ax.broken_barh(list(zip(start + cpu + e, other)), (y0, bar_h),
+            ax.broken_barh(list(zip(s + c + e, other)), (y0, bar_h),
                            facecolors=OTHER_OVH_COLOR, edgecolors='none')
         else:
-            ax.broken_barh(list(zip(start + cpu, overhead)), (y0, bar_h),
+            ax.broken_barh(list(zip(s + c, o)), (y0, bar_h),
                            facecolors=OVERHEAD_COLOR, edgecolors='none')
 
-        ax.broken_barh(list(zip(start + cpu + overhead, gpu)), (y0, bar_h),
+        ax.broken_barh(list(zip(s + c + o, g)), (y0, bar_h),
                        facecolors=GPU_COLOR, edgecolors='none')
 
         # Deadlines: downward triangle at release + relative deadline,
-        # red+larger when the release missed.
+        # red+larger when the release missed.  Clipped to the window when given.
         dl = start + d['deadline']
         missed = d['missed'].astype(bool)
-        if np.any(~missed):
-            ax.plot(dl[~missed], np.full((~missed).sum(), row), marker='v',
+        vis = np.ones(len(dl), dtype=bool)
+        if start_ms is not None:
+            vis = (dl >= start_ms) & (dl <= end_ms)
+        ok = (~missed) & vis
+        ms = missed & vis
+        if np.any(ok):
+            ax.plot(dl[ok], np.full(ok.sum(), row), marker='v',
                     linestyle='none', color='#555555', markersize=6,
                     alpha=0.6, zorder=3)
-        if np.any(missed):
-            ax.plot(dl[missed], np.full(missed.sum(), row), marker='v',
+        if np.any(ms):
+            ax.plot(dl[ms], np.full(ms.sum(), row), marker='v',
                     linestyle='none', color=OVERHEAD_COLOR, markersize=10,
                     alpha=1.0, zorder=4)
 
     ax.set_yticks(range(len(names)))
-    ax.set_yticklabels(names, fontsize=13)
+    ax.set_yticklabels(labels if labels is not None else names, fontsize=13)
     ax.set_ylim(-0.6, len(names) - 0.4)
-    ax.invert_yaxis()  # first task on top
+    ax.invert_yaxis()  # first task (highest priority) on top
     ax.tick_params(axis='x', labelsize=11)
     ax.set_title(title, fontsize=15, fontweight='bold', loc='left')
     ax.grid(axis='x', linestyle=':', linewidth=0.6, alpha=0.4)
+
+
+def _gantt_priority_order(panels) -> tuple[list[str], dict[str, str]]:
+    """Order tasks by their ASSIGNED SCHED_FIFO priority (higher = higher
+    priority, drawn on top) and build a per-task row label that carries it.
+
+    Priority is read straight from the trace's fifo_priority column, so the row
+    order follows whatever priorities the taskset assigns (no deadline-monotonic
+    assumption).  The CPU-only task (no GPU segment in any period) sorts below
+    the GPU tasks.  When the column is absent (older traces) the original trace
+    order and plain names are kept."""
+    meta: dict[str, int | None] = {}
+    cpu_only: dict[str, bool] = {}
+    names: list[str] = []
+    for d, _ in panels:
+        for t in d:
+            if t not in meta:
+                meta[t] = d[t].get('fifo_priority')
+                cpu_only[t] = not np.any(d[t]['gpu'] > 0)
+                names.append(t)
+
+    if all(v is None for v in meta.values()):
+        return names, {t: t for t in names}      # no priority info in trace
+
+    # GPU tasks first, descending FIFO priority (higher number = higher
+    # priority); the CPU-only task last.
+    names = sorted(names, key=lambda t: (1, 0) if cpu_only[t]
+                   else (0, -(meta[t] if meta[t] is not None else 0)))
+    labels = {t: (f'{t}  (CPU)' if cpu_only[t] else f'{t}  (prio {meta[t]})')
+              for t in names}
+    return names, labels
 
 
 def plot_taskset_gantt(gcaps, tsg, out_dir: str,
@@ -616,15 +706,12 @@ def plot_taskset_gantt(gcaps, tsg, out_dir: str,
               ((gcaps, 'GCAPS'), (tsg, 'TSG baseline'))
               if d]
 
-    # Consistent task ordering across panels: union, gcaps order first.
-    names: list[str] = []
-    for d, _ in panels:
-        for t in d:
-            if t not in names:
-                names.append(t)
+    # Task rows ordered by assigned FIFO priority (highest on top), each row
+    # labelled with its priority.
+    names, prio_labels = _gantt_priority_order(panels)
 
-    # Window [start_ms, end_ms]; bars outside are clipped by set_xlim, and
-    # segments straddling an edge render as partial bars.
+    # Window [start_ms, end_ms]; periods entirely outside are skipped when
+    # drawing, and segments straddling an edge render as partial bars.
     start_ms = max(0.0, start_s) * 1000.0
     end_ms = start_ms + max(0.0, duration_s) * 1000.0
 
@@ -635,10 +722,12 @@ def plot_taskset_gantt(gcaps, tsg, out_dir: str,
                              sharex=True, squeeze=False)
     axes = axes[:, 0]
 
+    row_labels = [prio_labels[t] for t in names]
     for ax, (d, lbl) in zip(axes, panels):
         # ε is only defined for the GCAPS (ioctl) panel; the TSG baseline issues
         # no runlist-update ioctls, so its overhead band stays unsplit.
-        _draw_gantt_panel(ax, d, names, lbl, eps=eps if lbl == 'GCAPS' else None)
+        _draw_gantt_panel(ax, d, names, lbl, row_labels, start_ms, end_ms,
+                          eps=eps if lbl == 'GCAPS' else None)
     axes[-1].set_xlabel('time since experiment start (ms)', fontsize=13)
     axes[-1].set_xlim(left=start_ms, right=end_ms)
 
@@ -709,6 +798,7 @@ def main() -> int:
 
     if ts_gcaps or ts_tsg:
         taskset_summary(ts_gcaps, ts_tsg)
+        taskset_utilization(ts_gcaps, ts_tsg)
         # Driver-measured epsilon from the captured GCAPS_EV kernel log (written
         # by measure_preempt_overhead.py --run taskset). Optional: absent log ->
         # the ε figure/overlay are skipped and the other plots are unchanged.

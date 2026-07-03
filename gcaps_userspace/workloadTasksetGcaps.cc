@@ -288,13 +288,14 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 	if (!f) { fprintf(stderr, "[task %s] could not open %s\n", td.name, path);
 	          return; }
 	for (const Rec& r : records)
-		fprintf(f, "%d,%s,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%d,%d,%llu,%llu\n",
+		fprintf(f, "%d,%s,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%d,%d,%llu,%llu,%d\n",
 		        task_idx, td.name, r.period_idx, r.period_start_ms,
 		        r.cpu_ms, r.ovh_ms, r.gpu_ms, r.resp_ms,
 		        ti_ms_eff, (int)r.missed,
 		        my_pid,
 		        (unsigned long long)r.seg_begin_ns,
-		        (unsigned long long)r.seg_done_ns);
+		        (unsigned long long)r.seg_done_ns,
+		        td.fifo_priority);
 	fclose(f);
 }
 
@@ -323,7 +324,8 @@ static void merge_and_summarise(const char* mode_tag)
 	if (!tr) { fprintf(stderr, "could not open %s\n", tracePath); return; }
 	fprintf(tr, "task_id,task_name,period_idx,period_start_ms,cpu_phase_ms,"
 	            "sched_preempt_overhead_ms,gpu_exec_ms,response_ms,"
-	            "deadline_ms,missed,pid,seg_begin_ns,seg_done_ns\n");
+	            "deadline_ms,missed,pid,seg_begin_ns,seg_done_ns,"
+	            "fifo_priority\n");
 
 	std::vector<double> resp[NUM_TASKS];
 
