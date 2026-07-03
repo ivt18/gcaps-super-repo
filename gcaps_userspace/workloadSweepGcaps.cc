@@ -6,7 +6,8 @@
  *
  * For each workload configuration (matmul 512..4096, histogram 4M..128M,
  * convolution 1024^2..4096^2 x kernel width 3/7/15, MLP width {256,512} x
- * {4,8} layers — identical to the source sweep) the workload runs as one
+ * {4,8} layers — the source sweep — plus matmul 2560 and MLP 1024x8 so every
+ * taskset workload has an isolated-baseline twin) the workload runs as one
  * GCAPS GPU segment, released N times back-to-back in isolation.  Per release
  * we record:
  *
@@ -71,11 +72,14 @@ static double p95(std::vector<double> v)
 	return v[idx];
 }
 
-/* Identical configuration set to buildSweepWorkloads() in workloads.cuh. */
+/* Configuration set of buildSweepWorkloads() in workloads.cuh, plus matmul
+ * 2560 and MLP 1024x8 (absent from the source sweep) so every workload of the
+ * taskset benchmark — and a scaled-up preemptOverheadGcaps victim — has an
+ * isolated-baseline twin here (for measure_preempt_overhead.py --baseline-ms). */
 static std::vector<SweepConfig> buildSweepConfigs()
 {
 	std::vector<SweepConfig> c;
-	for (int sz : {512, 1024, 2048, 4096})
+	for (int sz : {512, 1024, 2048, 2560, 4096})
 		c.push_back({SeqWlType::MATMUL, (unsigned)sz, 0});
 	for (unsigned sz : {4u << 20, 16u << 20, 64u << 20, 128u << 20})
 		c.push_back({SeqWlType::HISTOGRAM, sz, 0});
@@ -85,6 +89,7 @@ static std::vector<SweepConfig> buildSweepConfigs()
 	for (int W : {256, 512})
 		for (int L : {4, 8})
 			c.push_back({SeqWlType::MLP, (unsigned)W, (unsigned)L});
+	c.push_back({SeqWlType::MLP, 1024, 8});
 	return c;
 }
 
