@@ -4,10 +4,11 @@
  * Per-workload size sweep on the GCAPS userspace harness — the GCAPS analog of
  * singleTaskSched's bench/workloadSweepBench.cu.
  *
- * For each workload configuration (matmul 256..2048, histogram 1M..64M,
- * convolution 512^2..2048^2 x kernel width 3/7/15 — identical to the source
- * sweep) the workload runs as one GCAPS GPU segment, released N times
- * back-to-back in isolation.  Per release we record:
+ * For each workload configuration (matmul 512..4096, histogram 4M..128M,
+ * convolution 1024^2..4096^2 x kernel width 3/7/15, MLP width {256,512} x
+ * {4,8} layers — identical to the source sweep) the workload runs as one
+ * GCAPS GPU segment, released N times back-to-back in isolation.  Per release
+ * we record:
  *
  *   gpu_exec_ms               = cudaEvent(segment start -> stop) (on-GPU time)
  *   response_ms               = host wall time release -> segment done
@@ -74,13 +75,16 @@ static double p95(std::vector<double> v)
 static std::vector<SweepConfig> buildSweepConfigs()
 {
 	std::vector<SweepConfig> c;
-	for (int sz : {256, 512, 1024, 2048})
+	for (int sz : {512, 1024, 2048, 4096})
 		c.push_back({SeqWlType::MATMUL, (unsigned)sz, 0});
-	for (unsigned sz : {1u << 20, 4u << 20, 16u << 20, 64u << 20})
+	for (unsigned sz : {4u << 20, 16u << 20, 64u << 20, 128u << 20})
 		c.push_back({SeqWlType::HISTOGRAM, sz, 0});
-	for (int img : {512, 1024, 2048})
+	for (int img : {1024, 2048, 4096})
 		for (int kw : {3, 7, 15})
 			c.push_back({SeqWlType::CONVOLUTION, (unsigned)img, (unsigned)kw});
+	for (int W : {256, 512})
+		for (int L : {4, 8})
+			c.push_back({SeqWlType::MLP, (unsigned)W, (unsigned)L});
 	return c;
 }
 

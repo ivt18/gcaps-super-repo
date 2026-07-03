@@ -47,6 +47,18 @@ __global__ void seq_fill_float_kernel(float* p, uint32_t n, uint32_t seed)
 		p[i] = (float)(seq_wang_hash(i ^ seed) & 0xFFFFu) / 65536.0f;
 }
 
+/* Signed fill in [-scale, scale).  Used for MLP weights (scale = sqrt(3/W),
+ * giving unit-variance pre-activations) and biases (small scale). */
+__global__ void seq_fill_signed_kernel(float* p, uint32_t n, uint32_t seed,
+                                       float scale)
+{
+	for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+	     i += gridDim.x * blockDim.x) {
+		const float f = (float)(seq_wang_hash(i ^ seed) & 0xFFFFu) / 65536.0f;
+		p[i] = scale * (2.0f * f - 1.0f);
+	}
+}
+
 // ---- MATMUL — compute-intensive, 1 kernel ----------------------------------
 #define MM_TILE 16
 
@@ -135,6 +147,25 @@ __global__ void seq_conv_col_kernel(const float* tmp, const float* coef,
 	out[y * w + x] = acc;
 }
 
+// ---- MLP — DNN-style, 2 kernels per layer (matmul -> bias+ReLU) ------------
+// Square fully-connected network: batch = in_features = out_features = W, so
+// each layer's GEMM is W x W and reuses seq_matmul_kernel verbatim.  L layers
+// of [Z = A * Wt] -> [A' = ReLU(Z + bias)] give 2*L kernels, all launched
+// inside ONE GCAPS GPU segment (the source runs them as 2*L SequenceScheduler
+// segments).  Activations ping-pong between two scratch slabs.
+
+/* Fused bias add + ReLU, in place over an n x n activation matrix.
+ * bias is indexed by output feature (column) = i % n. */
+__global__ void seq_mlp_relu_bias_kernel(float* x, const float* bias, int n)
+{
+	const uint32_t total = (uint32_t)n * (uint32_t)n;
+	for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+	     i += gridDim.x * blockDim.x) {
+		const float v = x[i] + bias[i % (uint32_t)n];
+		x[i] = v > 0.0f ? v : 0.0f;
+	}
+}
+
 // ============================================================================
 // Host helpers
 // ============================================================================
@@ -145,6 +176,7 @@ const char* seqWlTypeName(SeqWlType t)
 		case SeqWlType::MATMUL:      return "matmul";
 		case SeqWlType::HISTOGRAM:   return "histogram";
 		case SeqWlType::CONVOLUTION: return "convolution";
+		case SeqWlType::MLP:         return "mlp";
 	}
 	return "?";
 }
@@ -198,7 +230,26 @@ SeqWorkload::SeqWorkload(SeqWlType type_, unsigned int p1_, unsigned int p2_,
 		convKr = (int)p2 / 2;
 		snprintf(name_, sizeof(name_), "conv_%d_k%d", (int)p1, (int)p2);
 		break;
+	case SeqWlType::MLP:
+		mlpW = (int)p1;
+		mlpL = (int)p2;
+		snprintf(name_, sizeof(name_), "mlp_%dx%d", mlpW, mlpL);
+		break;
 	}
+}
+
+/* Output of layer l lives in slab (l & 1); the final output is layer L-1. */
+float* SeqWorkload::mlpOutputSlab() const
+{
+	return ((mlpL - 1) & 1) ? d_mlpAct1 : d_mlpAct0;
+}
+
+/* Input activations consumed by layer l: the network input for l==0, else the
+ * previous layer's output slab. */
+float* SeqWorkload::mlpLayerInput(int l) const
+{
+	if (l == 0) return d_mlpInput;
+	return ((l - 1) & 1) ? d_mlpAct1 : d_mlpAct0;
 }
 
 SeqWorkload::~SeqWorkload() {}
@@ -263,6 +314,30 @@ void SeqWorkload::taskInit()
 			(uint32_t)((size_t)convW * convH), 0xD0D0u);
 		break;
 	}
+	case SeqWlType::MLP: {
+		const int W = mlpW, L = mlpL;
+		const size_t mat = (size_t)W * W * sizeof(float);
+		checkCudaErrors(cudaMalloc(&d_mlpInput,   mat));
+		checkCudaErrors(cudaMalloc(&d_mlpAct0,    mat));
+		checkCudaErrors(cudaMalloc(&d_mlpAct1,    mat));
+		checkCudaErrors(cudaMalloc(&d_mlpWeights, (size_t)L * mat));
+		checkCudaErrors(cudaMalloc(&d_mlpBias,
+			(size_t)L * W * sizeof(float)));
+
+		seq_fill_float_kernel<<<256, 256>>>(d_mlpInput,
+			(uint32_t)((size_t)W * W), 0xE0E0u);
+		const float wscale = sqrtf(3.0f / (float)W);   /* unit-variance Z */
+		for (int l = 0; l < L; ++l) {
+			seq_fill_signed_kernel<<<256, 256>>>(
+				d_mlpWeights + (size_t)l * W * W,
+				(uint32_t)((size_t)W * W),
+				0x1234u + (uint32_t)l * 7919u, wscale);
+			seq_fill_signed_kernel<<<256, 256>>>(
+				d_mlpBias + (size_t)l * W,
+				(uint32_t)W, 0x5678u + (uint32_t)l * 104729u, 0.01f);
+		}
+		break;
+	}
 	}
 	checkCudaErrors(cudaDeviceSynchronize());
 }
@@ -288,6 +363,19 @@ void SeqWorkload::launchKernels()
 		                      dim3(CONV_BLOCK, CONV_BLOCK, 1), 0, stream>>>(
 			d_tmp, d_coef, d_convOut, convW, convH, convKr);
 		break;
+	case SeqWlType::MLP: {
+		const int W = mlpW, L = mlpL;
+		for (int l = 0; l < L; ++l) {
+			float* inPtr  = mlpLayerInput(l);
+			float* outPtr = (l & 1) ? d_mlpAct1 : d_mlpAct0;
+			seq_matmul_kernel<<<matmulGrid(W), dim3(MM_TILE, MM_TILE, 1),
+			                    0, stream>>>(
+				inPtr, d_mlpWeights + (size_t)l * W * W, outPtr, W);
+			seq_mlp_relu_bias_kernel<<<256, 256, 0, stream>>>(
+				outPtr, d_mlpBias + (size_t)l * W, W);
+		}
+		break;
+	}
 	}
 }
 
@@ -371,6 +459,51 @@ bool SeqWorkload::verify()
 		free(inWin);
 		return ok;
 	}
+	case SeqWlType::MLP: {
+		/* Full forward pass in double on the host, spot-checked vs the GPU. */
+		const int W = mlpW, L = mlpL;
+		const size_t N = (size_t)W * W;
+		float*  hIn  = (float*)malloc(N * sizeof(float));
+		float*  hW   = (float*)malloc((size_t)L * N * sizeof(float));
+		float*  hB   = (float*)malloc((size_t)L * W * sizeof(float));
+		float*  hOut = (float*)malloc(N * sizeof(float));
+		double* cur  = (double*)malloc(N * sizeof(double));
+		double* nxt  = (double*)malloc(N * sizeof(double));
+		cudaMemcpy(hIn, d_mlpInput, N * sizeof(float),
+		           cudaMemcpyDeviceToHost);
+		cudaMemcpy(hW, d_mlpWeights, (size_t)L * N * sizeof(float),
+		           cudaMemcpyDeviceToHost);
+		cudaMemcpy(hB, d_mlpBias, (size_t)L * W * sizeof(float),
+		           cudaMemcpyDeviceToHost);
+		cudaMemcpy(hOut, mlpOutputSlab(), N * sizeof(float),
+		           cudaMemcpyDeviceToHost);
+
+		for (size_t i = 0; i < N; ++i) cur[i] = (double)hIn[i];
+		for (int l = 0; l < L; ++l) {
+			const float* Wl = hW + (size_t)l * N;
+			const float* Bl = hB + (size_t)l * W;
+			for (int r = 0; r < W; ++r)
+				for (int c = 0; c < W; ++c) {
+					double acc = 0.0;
+					for (int k = 0; k < W; ++k)
+						acc += cur[(size_t)r * W + k] *
+						       (double)Wl[(size_t)k * W + c];
+					acc += (double)Bl[c];
+					nxt[(size_t)r * W + c] = acc > 0.0 ? acc : 0.0;
+				}
+			double* t = cur; cur = nxt; nxt = t;
+		}
+
+		bool ok = true;
+		for (int s = 0; s < 256 && ok; ++s) {
+			const size_t idx = ((size_t)s * 2654435761u) % N;
+			const double ref = cur[idx];
+			const double got = (double)hOut[idx];
+			if (fabs(ref - got) > 1e-2 * fmax(1.0, fabs(ref))) ok = false;
+		}
+		free(hIn); free(hW); free(hB); free(hOut); free(cur); free(nxt);
+		return ok;
+	}
 	}
 	return false;
 }
@@ -380,6 +513,8 @@ void SeqWorkload::taskFinish()
 	cudaFree(d_A);      cudaFree(d_B);       cudaFree(d_C);
 	cudaFree(d_histIn); cudaFree(d_bins);    cudaFree(d_partials);
 	cudaFree(d_convIn); cudaFree(d_convOut); cudaFree(d_coef); cudaFree(d_tmp);
+	cudaFree(d_mlpInput); cudaFree(d_mlpWeights); cudaFree(d_mlpBias);
+	cudaFree(d_mlpAct0);  cudaFree(d_mlpAct1);
 	cudaEventDestroy(start);    cudaEventDestroy(stop);
 	cudaEventDestroy(ev_start); cudaEventDestroy(ev_stop);
 	cudaStreamDestroy(stream);

@@ -6,7 +6,7 @@
 #include "../base_task.h"
 
 /*
- * SeqWorkload — the matmul / histogram / convolution workloads from the
+ * SeqWorkload — the matmul / histogram / convolution / MLP workloads from the
  * singleTaskSched SequenceScheduler benchmark suite (bench/workloads.cuh),
  * ported into the GCAPS userspace harness.
  *
@@ -20,16 +20,20 @@
  *   MATMUL       compute-intensive: tiled square matmul        (1 kernel)
  *   HISTOGRAM    memory-intensive : 256-bin histogram          (2 kernels)
  *   CONVOLUTION  hybrid           : separable 2D box convolution(2 kernels)
+ *   MLP          DNN-style        : square fully-connected net (2*L kernels:
+ *                matmul + bias/ReLU per layer, all in one GCAPS segment)
  */
 
-enum class SeqWlType { MATMUL, HISTOGRAM, CONVOLUTION };
+enum class SeqWlType { MATMUL, HISTOGRAM, CONVOLUTION, MLP };
 
 const char* seqWlTypeName(SeqWlType t);
 
 class SeqWorkload : public BaseTask {
 public:
-	/* p1 = matmul n / histogram n_elements / convolution image side (w=h);
-	 * p2 = convolution kernel width (odd), ignored otherwise. */
+	/* p1 = matmul n / histogram n_elements / convolution image side (w=h) /
+	 *      mlp layer width;
+	 * p2 = convolution kernel width (odd) / mlp number of layers,
+	 *      ignored otherwise. */
 	SeqWorkload(SeqWlType type, unsigned int p1, unsigned int p2,
 	            int fd, bool sync_mode, bool ioctl_enabled, bool suspension);
 	~SeqWorkload();
@@ -82,6 +86,18 @@ private:
 	int    convW = 0, convH = 0, convKr = 0;
 	float *d_convIn = nullptr, *d_convOut = nullptr, *d_coef = nullptr,
 	      *d_tmp = nullptr;
+
+	/* mlp (square layers: batch = in = out = mlpW) */
+	int    mlpW = 0, mlpL = 0;          /* layer width; number of layers */
+	float *d_mlpInput = nullptr;        /* W*W input activations */
+	float *d_mlpWeights = nullptr;      /* L*W*W weight matrices (layer l at +l*W*W) */
+	float *d_mlpBias = nullptr;         /* L*W biases (layer l at +l*W) */
+	float *d_mlpAct0 = nullptr,         /* W*W ping-pong activation slabs */
+	      *d_mlpAct1 = nullptr;
+
+	/* Input activations consumed by layer l / output slab of the last layer. */
+	float* mlpLayerInput(int l) const;
+	float* mlpOutputSlab() const;
 };
 
 #endif // __SEQWORKLOAD_H__

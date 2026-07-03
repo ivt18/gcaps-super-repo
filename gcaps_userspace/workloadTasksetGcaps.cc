@@ -4,24 +4,29 @@
  * GCAPS-style mixed taskset on the GCAPS userspace harness — the GCAPS analog
  * of singleTaskSched's bench/workloadTasksetBench.cu.
  *
- * The task structure is ported verbatim from the source (GCAPS Table 4): same
- * C_i, T_i = D_i, CPU affinities and SCHED_FIFO priorities; the GPU segments
- * are the ported real workloads (matmul / histogram / convolution) run as one
- * GCAPS GPU segment per period:
+ * The task structure is ported verbatim from the source (GCAPS Table 4 for
+ * C_i, T_i = D_i and CPU affinities); the GPU segments are the ported real
+ * workloads (matmul / histogram / convolution / MLP) run as one GCAPS GPU
+ * segment per period.  Workload SIZES match the source's enlarged tuning for
+ * the fast AGX Orin GPU, and task 8 (mlp_1024x8) is the source's extension
+ * BEYOND GCAPS Table 4: an 8-layer square MLP (width 1024) — its 16 kernels
+ * (matmul + bias/ReLU per layer) all run inside the single GCAPS segment,
+ * where the source runs them as 16 SequenceScheduler segments.
  *
- *   1  hist_16M       histogram 16M    C=1ms  T=100ms CPU={1}   FIFO=7
- *   2  mm_1024        matmul 1024      C=2ms  T=150ms CPU={2}   FIFO=6
+ * Priorities are DEADLINE-MONOTONIC (shorter T = D => higher priority), NOT
+ * the GCAPS Table 4 assignment, matching the source benchmark.  ALL tasks are
+ * real-time (SCHED_FIFO); there are no best-effort tasks (which also avoids
+ * the GCAPS driver deadlock with >1 best-effort GPU task — see
+ * best-effort-tasks-bug.md).
+ *
+ *   1  hist_128M      histogram 128M   C=1ms  T=100ms CPU={1}   FIFO=8
+ *   2  mm_2048        matmul 2048      C=2ms  T=150ms CPU={2}   FIFO=6
  *   3  cpu_only       (CPU only)       C=67ms T=200ms CPU={2}   FIFO=5
- *   4  conv_1024_k7   conv 1024^2 k7   C=12ms T=300ms CPU={1}   FIFO=4
- *   5  conv_2048_k15  conv 2048^2 k15  C=2ms  T=400ms CPU={1}   FIFO=3
- *   6  mm_2048        matmul 2048      C=4ms  T=200ms CPU={4}   FIFO=2
- *   7  hist_4M        histogram 4M     C=4ms  T=67ms  CPU={4,5} FIFO=1
- *
- * NOTE: tasks 6 and 7 are GCAPS Table 4's best-effort tasks, but they are run
- * here at the two LOWEST real-time priorities rather than SCHED_OTHER — this
- * avoids a GCAPS driver deadlock with >1 best-effort GPU task (see
- * best-effort-tasks-bug.md) and matches the SequenceScheduler benchmark, which
- * has no best-effort class.
+ *   4  conv_4096_k7   conv 4096^2 k7   C=12ms T=300ms CPU={1}   FIFO=2
+ *   5  conv_4096_k15  conv 4096^2 k15  C=2ms  T=400ms CPU={1}   FIFO=1
+ *   6  mm_2560        matmul 2560      C=4ms  T=200ms CPU={4}   FIFO=4
+ *   7  hist_64M       histogram 64M    C=4ms  T=134ms CPU={4,5} FIFO=7
+ *   8  mlp_1024x8     MLP 1024x8 (DNN) C=2ms  T=250ms CPU={3}   FIFO=3
  *
  * One forked process per task (separate CUcontext) — required because GCAPS's
  * runlist-priority ioctl acts on a pid, so tasks must be distinct processes
@@ -42,7 +47,7 @@
  * and continues otherwise).
  *
  * Start-up is STAGGERED: each task creates its CUDA context and runs verify()
- * in its own 1 s slot, so the 7 contexts are brought up one at a time. Creating
+ * in its own 1 s slot, so the contexts are brought up one at a time. Creating
  * and first-touching all contexts simultaneously spins in the driver during
  * concurrent context bring-up (and deadlocks under -i 1); serialising it avoids
  * that. The synchronized periodic run only begins after every context is warm,
@@ -90,7 +95,7 @@
 // Task definitions (GCAPS Table 4 structure, ported real workloads)
 // ============================================================================
 
-static constexpr int NUM_TASKS = 7;
+static constexpr int NUM_TASKS = 8;
 
 struct BenchTaskDef {
 	const char*  name;
@@ -103,20 +108,21 @@ struct BenchTaskDef {
 	int          fifo_priority;  /* 0 = SCHED_OTHER */
 };
 
-/* All GPU tasks use distinct SCHED_FIFO priorities (no best-effort tasks): the
- * two formerly best-effort tasks (mm_2048, hist_4M) are given the two LOWEST
- * real-time priorities instead of SCHED_OTHER. This (a) avoids the GCAPS driver
- * best-effort deadlock (>1 concurrently-running best-effort GPU task — see
- * best-effort-tasks-bug.md) and (b) matches the SequenceScheduler benchmark,
- * which priority-schedules every GPU task and has no best-effort class. */
+/* Deadline-monotonic priorities (shorter T = D => higher priority), matching
+ * the source benchmark: SCHED_FIFO ranks all 8 tasks 8..1 by deadline.  All
+ * tasks are real-time — no best-effort tasks, which (a) avoids the GCAPS
+ * driver best-effort deadlock (>1 concurrently-running best-effort GPU task —
+ * see best-effort-tasks-bug.md) and (b) matches the SequenceScheduler
+ * benchmark, which priority-schedules every GPU task. */
 static const BenchTaskDef TASKS[NUM_TASKS] = {
-	{"hist_16M",      true,  SeqWlType::HISTOGRAM,   16u << 20, 0,  1, 100, {1, -1}, 7},
-	{"mm_1024",       true,  SeqWlType::MATMUL,      1024,      0,  2, 150, {2, -1}, 6},
-	{"cpu_only",      false, SeqWlType::MATMUL,      0,         0, 67, 200, {2, -1}, 5},
-	{"conv_1024_k7",  true,  SeqWlType::CONVOLUTION, 1024,      7, 12, 300, {1, -1}, 4},
-	{"conv_2048_k15", true,  SeqWlType::CONVOLUTION, 2048,     15,  2, 400, {1, -1}, 3},
-	{"mm_2048",       true,  SeqWlType::MATMUL,      2048,      0,  4, 200, {4, -1}, 2},
-	{"hist_4M",       true,  SeqWlType::HISTOGRAM,   4u << 20,  0,  4,  67, {4,  5}, 1},
+	{"hist_128M",     true,  SeqWlType::HISTOGRAM,   128u << 20, 0,  1, 100, {1, -1}, 8},
+	{"mm_2048",       true,  SeqWlType::MATMUL,      2048,       0,  2, 150, {2, -1}, 6},
+	{"cpu_only",      false, SeqWlType::MATMUL,      0,          0, 67, 200, {2, -1}, 5},
+	{"conv_4096_k7",  true,  SeqWlType::CONVOLUTION, 4096,       7, 12, 300, {1, -1}, 2},
+	{"conv_4096_k15", true,  SeqWlType::CONVOLUTION, 4096,      15,  2, 400, {1, -1}, 1},
+	{"mm_2560",       true,  SeqWlType::MATMUL,      2560,       0,  4, 200, {4, -1}, 4},
+	{"hist_64M",      true,  SeqWlType::HISTOGRAM,   64u << 20,  0,  4, 134, {4,  5}, 7},
+	{"mlp_1024x8",    true,  SeqWlType::MLP,         1024,       8,  2, 250, {3, -1}, 3},
 };
 
 // ============================================================================
@@ -153,7 +159,7 @@ static uint64_t g_experiment_ns   = 0;
 // x1/SCALE. Mirrors singleTaskSched's workloadTasksetBench -s SCALE. Set by -S.
 static double   g_period_scale    = 1.0;
 
-// Per-task init is staggered by this much so the 7 CUDA contexts are created
+// Per-task init is staggered by this much so the CUDA contexts are created
 // and first touch the GPU one at a time. Creating/initialising all contexts
 // simultaneously spins (and deadlocks under -i 1) in the driver during
 // concurrent context bring-up; serialising it avoids the storm. See README.
@@ -187,7 +193,7 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 
 	/* Staggered start-up: each task initialises its CUDA context (and runs
 	 * verify()) in its own slot so context bring-up is serialised across tasks
-	 * rather than a simultaneous 7-context storm that hangs the driver. */
+	 * rather than a simultaneous multi-context storm that hangs the driver. */
 	sleep_until_abs_ns(g_init_start_ns + (uint64_t)task_idx * INIT_STAGGER_NS);
 
 	SeqWorkload* wl = nullptr;
