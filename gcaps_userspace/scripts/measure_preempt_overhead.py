@@ -55,6 +55,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 # Percentile of non-preempted active time used as the warm-execution baseline.
 # Low enough to sit on the warm floor (immune to start-up warmup / contention,
@@ -359,18 +360,35 @@ def run_and_capture(kind, duration, extra, events_path, no_sudo):
     cmd = sudo + [binary, "-i", "1", "-s", "1", "-d", str(duration)] + extra
     print("clearing kernel log (dmesg -C) ...")
     subprocess.run(sudo + ["dmesg", "-C"], check=False)
-    print("running:", " ".join(cmd))
-    subprocess.run(cmd, check=False)
-    print("capturing GCAPS_EV lines from dmesg ...")
-    res = subprocess.run(sudo + ["dmesg"], capture_output=True, text=True)
-    ev_lines = [l for l in res.stdout.splitlines() if "GCAPS_EV" in l]
+    # Stream the kernel log DURING the run (dmesg --follow) instead of dumping
+    # the ring buffer afterwards: the default ~128 KiB buffer holds only ~860
+    # GCAPS_EV lines, so a post-run dump silently keeps just the LAST few
+    # seconds of a busy run. Events lost that way make their releases look
+    # "non-preempted" (poisoning the in-run warm floor with wall times that
+    # still include unattributed suspension) and undercount preemptions.
+    print("running:", " ".join(cmd), " [streaming dmesg --follow]")
+    raw_path = events_path + ".raw"
+    with open(raw_path, "w") as rawf:
+        follower = subprocess.Popen(sudo + ["dmesg", "--follow"],
+                                    stdout=rawf, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run(cmd, check=False)
+            time.sleep(1.0)                    # let trailing events flush
+        finally:
+            follower.terminate()
+            try:
+                follower.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                follower.kill()
+    with open(raw_path) as f:
+        ev_lines = [l.rstrip("\n") for l in f if "GCAPS_EV" in l]
+    os.remove(raw_path)
     with open(events_path, "w") as f:
         f.write("\n".join(ev_lines) + ("\n" if ev_lines else ""))
     print(f"  {len(ev_lines)} GCAPS_EV line(s) -> {events_path}")
     if len(ev_lines) == 0:
         print("  WARNING: 0 events. Check: patched driver loaded? -i 1? "
-              "kernel.dmesg_restrict (read dmesg as root)? log buffer overflow "
-              "(increase CONFIG_LOG_BUF_SHIFT / use a shorter -d)?")
+              "kernel.dmesg_restrict (read dmesg as root)?")
     return events_path, trace
 
 
