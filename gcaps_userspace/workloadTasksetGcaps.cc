@@ -46,16 +46,25 @@
  * All tasks request SCHED_FIFO — run with sudo for that to take effect (warns
  * and continues otherwise).
  *
- * Start-up is STAGGERED: each task creates its CUDA context and runs verify()
- * in its own 1 s slot, so the contexts are brought up one at a time. Creating
- * and first-touching all contexts simultaneously spins in the driver during
- * concurrent context bring-up (and deadlocks under -i 1); serialising it avoids
- * that. The synchronized periodic run only begins after every context is warm,
- * so there is a ~(NUM_TASKS+1) s one-time warm-up before the timed window.
+ * Start-up is STAGGERED: each task creates its CUDA context and runs its
+ * warm-up executions (-w) in its own 1 s slot, so the contexts are brought up
+ * one at a time. Creating and first-touching all contexts simultaneously spins
+ * in the driver during concurrent context bring-up (and deadlocks under -i 1);
+ * serialising it avoids that. The synchronized periodic run only begins after
+ * every context is warm, so there is a ~(NUM_TASKS+1) s one-time warm-up
+ * before the timed window.
+ *
+ * Verification runs AFTER the measurement window (post-run), not during init:
+ * mlp_1024x8's host reference is a full 8-layer forward pass (~1e10 MACs,
+ * tens of seconds on one A78 core), which used to overrun the init slot and
+ * the whole experiment window, so the task silently recorded zero samples.
+ * Post-run, a slow reference costs only shutdown time; a FAILED verdict still
+ * invalidates the run.  Warm-up (formerly a side effect of verify) is now
+ * explicit: -w N runs each task's segment N times during its init slot.
  *
  * Usage:  workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S]
- *                              [-k N] [-S SCALE]
- *         (defaults: -i 0 -s 0 -b 0 -d 30 -S 1.0, all GPU tasks)
+ *                              [-k N] [-S SCALE] [-w WARMUP]
+ *         (defaults: -i 0 -s 0 -b 0 -d 30 -S 1.0 -w 1, all GPU tasks)
  *         -k N : activate only the first N GPU tasks (CPU-only task always
  *                runs) — for bisecting how many concurrent GPU contexts the
  *                GCAPS elevation path tolerates before deadlocking.
@@ -158,6 +167,10 @@ static uint64_t g_experiment_ns   = 0;
 // the CPU-only task's period) unchanged, so SCALE < 1 raises GPU utilization by
 // x1/SCALE. Mirrors singleTaskSched's workloadTasksetBench -s SCALE. Set by -S.
 static double   g_period_scale    = 1.0;
+// Warm-up executions per GPU task during its init slot (CLI -w).  Replaces the
+// warm-up that verify() used to provide during init; verification itself now
+// runs after the measurement window (post-run verify in run_task).
+static int      g_warmup_runs     = 1;
 
 // Per-task init is staggered by this much so the CUDA contexts are created
 // and first touch the GPU one at a time. Creating/initialising all contexts
@@ -192,8 +205,9 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 	}
 
 	/* Staggered start-up: each task initialises its CUDA context (and runs
-	 * verify()) in its own slot so context bring-up is serialised across tasks
-	 * rather than a simultaneous multi-context storm that hangs the driver. */
+	 * its -w warm-up executions) in its own slot so context bring-up is
+	 * serialised across tasks rather than a simultaneous multi-context storm
+	 * that hangs the driver. */
 	sleep_until_abs_ns(g_init_start_ns + (uint64_t)task_idx * INIT_STAGGER_NS);
 
 	SeqWorkload* wl = nullptr;
@@ -201,8 +215,11 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 		wl = new SeqWorkload(td.wlType, td.wlP1, td.wlP2, fd, sync_mode,
 		                     ioctl_enabled, suspension);
 		wl->taskInit();
-		const bool ok = wl->verify();
-		if (!ok) fprintf(stderr, "[task %s] WARNING: verify FAILED\n", td.name);
+		/* Warm-up only — verification is deferred to after the measurement
+		 * window (see post-run verify below), so a slow host reference
+		 * cannot overrun the init slot and eat the experiment. */
+		for (int w = 0; w < g_warmup_runs; ++w)
+			wl->taskCallback(0, 0);
 		wl->recordPriority(td.fifo_priority);
 	}
 
@@ -278,9 +295,9 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 		next_period_start += period_ns;
 	}
 
-	if (wl) { wl->taskFinish(); delete wl; }
-
-	/* Each child writes its own trace fragment; parent merges them. */
+	/* Each child writes its own trace fragment; parent merges them.  Written
+	 * BEFORE the post-run verify so the data is on disk even if the (possibly
+	 * slow) verification is interrupted. */
 	char path[160];
 	snprintf(path, sizeof(path),
 	         "results/workloadBench/.tsk_%s_%d.csv", mode_tag, task_idx);
@@ -297,6 +314,18 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 		        (unsigned long long)r.seg_done_ns,
 		        td.fifo_priority);
 	fclose(f);
+
+	/* Post-run verification — off the timing path by design.  mlp_1024x8's
+	 * host reference takes tens of seconds on one A78 core; announce it so a
+	 * long silent tail is not mistaken for the runlist-cache-desync hang. */
+	if (wl) {
+		fprintf(stderr, "[task %s] post-run verify...\n", td.name);
+		const bool ok = wl->verify();
+		fprintf(stderr, "[task %s] post-run verify %s\n", td.name,
+		        ok ? "PASS" : "FAILED");
+		wl->taskFinish();
+		delete wl;
+	}
 }
 
 // ============================================================================
@@ -396,7 +425,7 @@ int main(int argc, char** argv)
 	uint64_t duration_s = 30;
 	int gpu_limit = -1;   /* -1 = all GPU tasks; else activate only first N */
 	int opt;
-	while ((opt = getopt(argc, argv, "i:s:b:d:k:S:")) != EOF) {
+	while ((opt = getopt(argc, argv, "i:s:b:d:k:S:w:")) != EOF) {
 		switch (opt) {
 			case 'i': ioctl_enabled = atoi(optarg); break;
 			case 's': suspension    = atoi(optarg); break;
@@ -404,8 +433,13 @@ int main(int argc, char** argv)
 			case 'd': duration_s    = strtoull(optarg, nullptr, 10); break;
 			case 'k': gpu_limit     = atoi(optarg); break;
 			case 'S': g_period_scale = atof(optarg); break;
+			case 'w': g_warmup_runs = atoi(optarg); break;
 			default:  fprintf(stderr, "bad option\n"); return 1;
 		}
+	}
+	if (g_warmup_runs < 0) {
+		fprintf(stderr, "warmup (-w) must be >= 0\n");
+		return 1;
 	}
 	if (sync_mode && ioctl_enabled) {
 		fprintf(stderr, "IOCTL and sync mode are mutually exclusive\n");
@@ -435,10 +469,10 @@ int main(int argc, char** argv)
 	                + (uint64_t)NUM_TASKS * INIT_STAGGER_NS
 	                + POSTINIT_MARGIN_NS;
 
-	printf("Taskset: mode=%s, duration=%llus, staggered init "
+	printf("Taskset: mode=%s, duration=%llus, warmup=%d, staggered init "
 	       "(%d x %.1f s) then experiment starts in %.1f s",
 	       ioctl_enabled ? "GCAPS-ioctl" : "TSG-default",
-	       (unsigned long long)duration_s, NUM_TASKS,
+	       (unsigned long long)duration_s, g_warmup_runs, NUM_TASKS,
 	       (double)INIT_STAGGER_NS / 1.0e9,
 	       (double)(g_sync_start_ns - host_ns()) / 1.0e9);
 	if (gpu_limit >= 0)

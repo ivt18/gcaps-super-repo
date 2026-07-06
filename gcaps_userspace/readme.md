@@ -6,7 +6,7 @@ The two macros to mark the GPU segment boundaries are defined [here](common/incl
 ## Preparations
 On target Jetson device:
 ```bash
-sudo nvpmodel -m 2 # set power mode
+sudo nvpmodel -m 0 # set power mode (MAXN — all measurements in this repo were taken at -m 0)
 sudo /usr/bin/jetson_clocks # set clock speed to the max
 sudo sysctl -w kernel.sched_rt_runtime_us=-1 # enable real-time priorities
 ```
