@@ -394,11 +394,35 @@ void SeqWorkload::taskCallback(int insId, int nIter)
 	cudaEventElapsedTime(&last_gpu_ms, ev_start, ev_stop);
 }
 
-bool SeqWorkload::verify()
+void SeqWorkload::warmup()
 {
 	launchKernels();
-	checkCudaErrors(cudaStreamSynchronize(stream));
+	cudaStreamSynchronize(stream);
+}
 
+bool SeqWorkload::verify(bool relaunch)
+{
+	/* The whole GPU-touching part — the optional relaunch AND the D2H
+	 * copies inside verifyChecks() — runs within one GCAPS segment
+	 * bracket.  After any ioctl activity this context's TSG entries
+	 * (compute and copy engine) are off the runlist, and unbracketed GPU
+	 * work — a kernel launch or a plain cudaMemcpy — is never redispatched
+	 * by the driver (runlist-cache-desync mechanism), blocking forever.
+	 * The bracket re-adds the TSG for the duration of the verification.
+	 * With ioctl mode off the macros reduce to event records. */
+	int pid = getpid();
+	gcapsGpuSegBegin(fd, pid, sync_mode, ioctl_enabled);
+	if (relaunch) {
+		launchKernels();
+		checkCudaErrors(cudaStreamSynchronize(stream));
+	}
+	const bool ok = verifyChecks();
+	gcapsGpuSegEnd(fd, pid, sync_mode, stream, ioctl_enabled);
+	return ok;
+}
+
+bool SeqWorkload::verifyChecks()
+{
 	switch (type) {
 	case SeqWlType::MATMUL: {
 		const int n = mmN;

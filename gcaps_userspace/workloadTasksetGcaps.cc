@@ -217,9 +217,16 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 		wl->taskInit();
 		/* Warm-up only — verification is deferred to after the measurement
 		 * window (see post-run verify below), so a slow host reference
-		 * cannot overrun the init slot and eat the experiment. */
+		 * cannot overrun the init slot and eat the experiment.  warmup()
+		 * launches WITHOUT the GCAPS bracket: no ioctl must run before the
+		 * synchronized start, because GCAPS runlist rebuilds interleaved
+		 * with the later tasks' context bring-up (a normal-path runlist
+		 * writer) stale the driver's runlist cache and raise the odds of
+		 * the mid-run cache-desync hang (see runlist-cache-desync-bug.md).
+		 * Unbracketed launches are safe at init time precisely because no
+		 * ioctl has run yet. */
 		for (int w = 0; w < g_warmup_runs; ++w)
-			wl->taskCallback(0, 0);
+			wl->warmup();
 		wl->recordPriority(td.fifo_priority);
 	}
 
@@ -317,10 +324,20 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 
 	/* Post-run verification — off the timing path by design.  mlp_1024x8's
 	 * host reference takes tens of seconds on one A78 core; announce it so a
-	 * long silent tail is not mistaken for the runlist-cache-desync hang. */
+	 * long silent tail is not mistaken for a hang.
+	 *
+	 * verify(false): check the residual outputs of the LAST executed segment
+	 * (all kernels overwrite their outputs) instead of launching afresh.
+	 * verify() runs its GPU work — including the D2H copies of the checks —
+	 * inside a GCAPS segment bracket, because after the experiment every
+	 * task's final gcapsGpuSegEnd left this context's TSG entries (compute
+	 * AND copy engine) off the runlist, where unbracketed GPU work is never
+	 * redispatched and blocks forever.  Under -i 1 the brackets serialise
+	 * the tasks' verifications by priority; mlp's ~minute host pass holds
+	 * its segment meanwhile — a shutdown cost only. */
 	if (wl) {
 		fprintf(stderr, "[task %s] post-run verify...\n", td.name);
-		const bool ok = wl->verify();
+		const bool ok = wl->verify(false);
 		fprintf(stderr, "[task %s] post-run verify %s\n", td.name,
 		        ok ? "PASS" : "FAILED");
 		wl->taskFinish();

@@ -43,8 +43,27 @@ public:
 	void taskFinish() override;
 	void recordPriority(int priority) override;
 
-	/* Run the workload once on the stream (no ioctl) and check correctness. */
-	bool verify();
+	/* Check output correctness against a host reference.  The whole
+	 * GPU-touching part — the optional relaunch AND the device-to-host
+	 * copies inside the checks — runs within one GCAPS segment bracket:
+	 * after any ioctl activity this context's TSG entries (compute and
+	 * copy engine) are off the runlist, where unbracketed GPU work is
+	 * never redispatched and blocks forever (runlist-cache-desync
+	 * mechanism).  With ioctl mode off the bracket reduces to event
+	 * records.  Pass relaunch=false to skip the kernel run and check the
+	 * residual outputs of the last execution instead (all kernels
+	 * overwrite their outputs, so the buffers hold exactly what a fresh
+	 * run would produce). */
+	bool verify(bool relaunch = true);
+
+	/* One un-timed execution WITHOUT the GCAPS bracket, for init-phase
+	 * warm-up.  Only safe before any GCAPS ioctl has run (unbracketed GPU
+	 * work after ioctl activity is never redispatched — see verify()); its
+	 * point is exactly that: no ioctl may run before the synchronized
+	 * start, since GCAPS runlist rebuilds interleaved with the later
+	 * tasks' context bring-up stale the driver's runlist cache and raise
+	 * the odds of the cache-desync hang mid-run. */
+	void warmup();
 
 	const char* name() const { return name_; }
 	/* GPU-segment time (ms) measured by cudaEvents on the last taskCallback. */
@@ -52,6 +71,7 @@ public:
 
 private:
 	void launchKernels();   /* enqueue this workload's kernels on `stream` */
+	bool verifyChecks();    /* per-type host-reference checks (D2H copies inside) */
 
 	SeqWlType    type;
 	unsigned int p1, p2;
