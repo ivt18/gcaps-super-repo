@@ -30,8 +30,20 @@ NVCC          := $(CUDA_PATH)/bin/nvcc
 NVCCFLAGS 	:= -O3 -I/usr/local/cuda/include -lrt -lcuda -lcufft
 LDFLAGS     := -lcudart -L/usr/local/cuda/lib64
 
+# Path to the *patched* nvgpu UAPI headers (must contain linux/nvgpu.h and
+# the GCAPS-extended linux/nvgpu-ctrl.h — see ../gcaps_driver_patch/).
+# Prefers a vendored copy in ./uapi if present; otherwise override:
+#     make NVGPU_UAPI=/path/to/nvgpu/include/uapi <target>
+# To vendor (recommended, survives checkouts):
+#     mkdir -p uapi && cp -r <kernel-tree>/nvgpu/include/uapi/linux uapi/
+ifneq ($(wildcard $(PROJECT_DIR)/uapi/linux/nvgpu.h),)
+NVGPU_UAPI ?= $(PROJECT_DIR)/uapi
+else
+NVGPU_UAPI ?= /home/yidi/kernel-r3521/nvgpu/include/uapi
+endif
+
 INCLUDES  	:= -I/usr/local/include
-INCLUDES 	+= -I/home/yidi/kernel-r3521/nvgpu/include/uapi # change this directory to the one that contains the copied /linux/nvgpu-ctrl.h file.
+INCLUDES 	+= -I$(NVGPU_UAPI)
 INCLUDES	+= -I$(PROJECT_DIR)
 INCLUDES	+= -I$(PROJECT_DIR)/common/cuda_inc
 INCLUDES  	+= -I$(CUDA_PATH)/samples/common/inc
