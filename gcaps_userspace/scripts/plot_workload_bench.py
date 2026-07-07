@@ -54,9 +54,12 @@ Figures written to --results-dir:
   taskset_gantt.pdf       — stacked GCAPS-vs-TSG execution Gantt over the
                             window [--gantt-start, +--gantt-duration]; each
                             period tiled CPU (green) | overhead (red, split into
-                            ε + other when available) | GPU (purple); rows
-                            ordered by the trace's fifo_priority (highest on
-                            top, CPU-only task last)
+                            ε + other when available) | GPU (purple); with the
+                            event log the driver-reported suspended intervals are
+                            carved out of the GPU block (olive), so preemptions
+                            are visible and purple reads as GPU actively
+                            executing; rows ordered by the trace's fifo_priority
+                            (highest on top, CPU-only task last)
 
 Usage:
     python3 scripts/plot_workload_bench.py \\
@@ -91,6 +94,13 @@ GPU_COLOR = '#9467bd'       # purple — GPU execution
 # scheduling/preemption delay) when the GCAPS_EV event log is available.
 EPS_COLOR = '#d62728'       # red    — measured epsilon (runlist update)
 OTHER_OVH_COLOR = '#9e9e9e' # grey   — other overhead (launch + GPU-side delay)
+
+# The GPU (cudaEvent) wall window INCLUDES time the segment sat suspended while a
+# higher-priority job ran (verified on AGX Orin: gpu_wall ≈ active + suspended).
+# When the GCAPS_EV log is present the Gantt carves those driver-reported
+# suspended intervals out of the purple GPU block so preemptions are visible and
+# the purple then reads as GPU *actively executing* (matching the seq Gantt).
+SUSPENDED_COLOR = '#bcbd22' # olive  — suspended (preempted, GPU idle for this job)
 
 # One structured driver record per runlist-update ioctl (see the driver patch):
 #   GCAPS_EV ts=<ns> cpid=<pid> prio=<n> add=<0|1> rlupd=<0|1> \
@@ -176,7 +186,8 @@ def load_taskset(path: str) -> dict[str, dict[str, np.ndarray]] | None:
 
 def load_events(path: str) -> list[dict] | None:
     """Parse GCAPS_EV lines from a captured kernel-log file ->
-    list of {ts, cpid, add, rlupd, eps_us, preempted}. None if absent/empty."""
+    list of {ts, cpid, add, rlupd, eps_us, preempted, resumed}, sorted by ts.
+    None if absent/empty."""
     if not os.path.isfile(path):
         print(f'  [skip] {path} not found')
         return None
@@ -188,10 +199,12 @@ def load_events(path: str) -> list[dict] | None:
                 evs.append({'ts': int(m.group(1)), 'cpid': int(m.group(2)),
                             'add': int(m.group(4)), 'rlupd': int(m.group(5)),
                             'eps_us': int(m.group(6)),
-                            'preempted': int(m.group(7))})
+                            'preempted': int(m.group(7)),
+                            'resumed': int(m.group(8))})
     if not evs:
         print(f'  [skip] no GCAPS_EV lines in {path}')
         return None
+    evs.sort(key=lambda e: e['ts'])
     return evs
 
 
@@ -229,6 +242,55 @@ def attribute_epsilon(taskset: dict[str, dict[str, np.ndarray]],
                 b, e = d['seg_begin'][i], d['seg_done'][i]
                 eps[i] = sum(us for ts, us in evs if b <= ts <= e) / 1.0e3
         out[t] = eps
+    return out
+
+
+def reconstruct_suspend_intervals(events: list[dict]) -> dict[int, list[tuple[int, int]]]:
+    """Pair each `preempted=V` event with the next `resumed=V` -> per victim pid
+    a sorted list of (start_ns, end_ns) suspended intervals.  Mirrors
+    measure_preempt_overhead.py's reconstruction so the Gantt and the numeric
+    analysis agree.  Only victims with pid > 0 count (preempted=-1 = the add
+    admitted into an idle runlist, i.e. no real preemption)."""
+    pending: dict[int, int] = {}          # victim pid -> ts it was preempted
+    intervals: list[tuple[int, int, int]] = []
+    for e in events:                      # events already sorted by ts
+        if e['preempted'] > 0:
+            pending.setdefault(e['preempted'], e['ts'])
+        if e['resumed'] > 0 and e['resumed'] in pending:
+            intervals.append((e['resumed'], pending.pop(e['resumed']), e['ts']))
+    by_pid: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for pid, s, t in intervals:
+        if t > s:
+            by_pid[pid].append((s, t))
+    for pid in by_pid:
+        by_pid[pid].sort()
+    return by_pid
+
+
+def attribute_suspensions(taskset: dict[str, dict[str, np.ndarray]],
+                          events: list[dict]) -> dict[str, list] | None:
+    """Per-release list of driver-reported suspended intervals (absolute ns) that
+    fall within each release's GPU segment [seg_begin, seg_done].  Returns
+    {task -> [ [(s_ns, e_ns), ...] per release ]} aligned with the release
+    arrays, or None if the trace lacks pid/segment bounds."""
+    if not any('pid' in d for d in taskset.values()):
+        return None
+    by_pid = reconstruct_suspend_intervals(events)
+    out: dict[str, list] = {}
+    for t, d in taskset.items():
+        n = len(d['start'])
+        per_release: list[list[tuple[int, int]]] = [[] for _ in range(n)]
+        if 'pid' in d and len(d['pid']):
+            ivs = by_pid.get(int(d['pid'][0]), [])
+            for i in range(n):
+                b, e = int(d['seg_begin'][i]), int(d['seg_done'][i])
+                if e <= b:
+                    continue
+                for s, t2 in ivs:
+                    lo, hi = max(s, b), min(t2, e)
+                    if hi > lo:
+                        per_release[i].append((lo, hi))
+        out[t] = per_release
     return out
 
 
@@ -579,13 +641,34 @@ def plot_epsilon(events: list[dict], pid2name: dict[int, str], out_dir: str,
     print(f'  wrote {path}')
 
 
+def _subtract_intervals(a: float, b: float,
+                        holes: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Complement of `holes` within [a, b] as a list of (start, width) spans."""
+    hs = sorted((max(s, a), min(e, b)) for s, e in holes if min(e, b) > max(s, a))
+    out: list[tuple[float, float]] = []
+    cur = a
+    for s, e in hs:
+        if s > cur:
+            out.append((cur, s - cur))
+        cur = max(cur, e)
+    if b > cur:
+        out.append((cur, b - cur))
+    return out
+
+
 def _draw_gantt_panel(ax, data, names: list[str], title: str,
                       labels: list[str] | None = None,
                       start_ms: float | None = None,
                       end_ms: float | None = None,
-                      eps: dict[str, np.ndarray] | None = None) -> None:
+                      eps: dict[str, np.ndarray] | None = None,
+                      susp: dict[str, list] | None = None) -> None:
     """Draw one Gantt panel: one row per task, each period tiled as
     CPU (green) | overhead (red) | GPU (purple) broken_barh segments.
+
+    When ``susp`` is given (GCAPS panel only), the driver-reported suspended
+    intervals are carved out of the purple GPU block in SUSPENDED_COLOR, so a
+    preempted release renders as GPU–suspended–GPU and the purple then reads as
+    GPU *actively executing* (the seq Gantt's convention).
 
     When [start_ms, end_ms] is given, periods that fall entirely outside the
     window are skipped — visually identical to the caller's xlim clip, but it
@@ -629,8 +712,41 @@ def _draw_gantt_panel(ax, data, names: list[str], title: str,
             ax.broken_barh(list(zip(s + c, o)), (y0, bar_h),
                            facecolors=OVERHEAD_COLOR, edgecolors='none')
 
-        ax.broken_barh(list(zip(s + c + o, g)), (y0, bar_h),
-                       facecolors=GPU_COLOR, edgecolors='none')
+        sus_t = susp.get(t) if susp is not None else None
+        if (sus_t is not None and len(sus_t) == len(start)
+                and 'seg_begin' in d):
+            # Carve the driver-reported suspended intervals out of each purple
+            # GPU block.  The GPU block [g0, g1] spans the last gpu_ms of the
+            # segment window [seg_begin, seg_done]; map an absolute suspended
+            # interval to the axis via  ms(x) = (start+cpu) + (x - seg_begin)/1e6
+            # (seg_begin -> start+cpu, seg_done -> start+resp = g1) and clip to
+            # [g0, g1].  The ~ε front-loading of the overhead band shifts the
+            # block by <1 ms, negligible at Gantt scale.
+            idxs = np.nonzero(keep)[0]
+            active_spans: list[tuple[float, float]] = []
+            susp_spans: list[tuple[float, float]] = []
+            for k in idxs:
+                g0 = float(start[k] + cpu[k] + overhead[k])
+                g1 = g0 + float(gpu[k])
+                if g1 <= g0:
+                    continue
+                sb = float(d['seg_begin'][k])
+                base_ms = float(start[k] + cpu[k])
+                holes = [(base_ms + (hs - sb) / 1.0e6, base_ms + (he - sb) / 1.0e6)
+                         for hs, he in sus_t[k]]
+                holes = [(max(a, g0), min(b, g1)) for a, b in holes
+                         if min(b, g1) > max(a, g0)]
+                active_spans += _subtract_intervals(g0, g1, holes)
+                susp_spans += [(a, b - a) for a, b in holes]
+            if active_spans:
+                ax.broken_barh(active_spans, (y0, bar_h),
+                               facecolors=GPU_COLOR, edgecolors='none')
+            if susp_spans:
+                ax.broken_barh(susp_spans, (y0, bar_h),
+                               facecolors=SUSPENDED_COLOR, edgecolors='none')
+        else:
+            ax.broken_barh(list(zip(s + c + o, g)), (y0, bar_h),
+                           facecolors=GPU_COLOR, edgecolors='none')
 
         # Deadlines: downward triangle at release + relative deadline,
         # red+larger when the release missed.  Clipped to the window when given.
@@ -694,7 +810,8 @@ def plot_taskset_gantt(gcaps, tsg, out_dir: str,
                        inches_per_sec: float = GANTT_INCHES_PER_S,
                        start_s: float = 0.0,
                        duration_s: float = 10.0,
-                       eps: dict[str, np.ndarray] | None = None) -> None:
+                       eps: dict[str, np.ndarray] | None = None,
+                       susp: dict[str, list] | None = None) -> None:
     """Stacked GCAPS-vs-TSG Gantt over the window [start_s, start_s +
     duration_s], shared time axis.
 
@@ -724,10 +841,12 @@ def plot_taskset_gantt(gcaps, tsg, out_dir: str,
 
     row_labels = [prio_labels[t] for t in names]
     for ax, (d, lbl) in zip(axes, panels):
-        # ε is only defined for the GCAPS (ioctl) panel; the TSG baseline issues
-        # no runlist-update ioctls, so its overhead band stays unsplit.
+        # ε and suspended intervals are only defined for the GCAPS (ioctl) panel;
+        # the TSG baseline issues no runlist-update ioctls, so its overhead band
+        # stays unsplit and its GPU block uncarved.
         _draw_gantt_panel(ax, d, names, lbl, row_labels, start_ms, end_ms,
-                          eps=eps if lbl == 'GCAPS' else None)
+                          eps=eps if lbl == 'GCAPS' else None,
+                          susp=susp if lbl == 'GCAPS' else None)
     axes[-1].set_xlabel('time since experiment start (ms)', fontsize=13)
     axes[-1].set_xlim(left=start_ms, right=end_ms)
 
@@ -738,10 +857,17 @@ def plot_taskset_gantt(gcaps, tsg, out_dir: str,
         if eps is not None else
         [mpatches.Patch(facecolor=OVERHEAD_COLOR, label='sched+preempt overhead')]
     )
+    gpu_handles = (
+        [mpatches.Patch(facecolor=GPU_COLOR, label='GPU exec (active)'),
+         mpatches.Patch(facecolor=SUSPENDED_COLOR,
+                        label='suspended (preempted, GCAPS)')]
+        if susp is not None else
+        [mpatches.Patch(facecolor=GPU_COLOR, label='GPU exec')]
+    )
     legend_handles = [
         mpatches.Patch(facecolor=CPU_COLOR, label='CPU phase'),
         *ovh_handles,
-        mpatches.Patch(facecolor=GPU_COLOR, label='GPU exec'),
+        *gpu_handles,
         plt.Line2D([0], [0], marker='v', color='#555555', linestyle='none',
                    markersize=6, label='deadline'),
         plt.Line2D([0], [0], marker='v', color=OVERHEAD_COLOR,
@@ -805,19 +931,23 @@ def main() -> int:
         print('Loading GCAPS_EV event log…')
         ts_events = load_events(os.path.join(out, 'taskset_gcaps_events.log'))
         ts_eps = None
+        ts_susp = None
         if ts_events and ts_gcaps:
             epsilon_summary(ts_events)
             plot_epsilon(ts_events, pid_to_name(ts_gcaps), out,
                          list(ts_gcaps.keys()))
             ts_eps = attribute_epsilon(ts_gcaps, ts_events)
+            ts_susp = attribute_suspensions(ts_gcaps, ts_events)
             if ts_eps is None:
-                print('  [note] trace lacks pid/seg columns — ε overlay on '
-                      'breakdown/Gantt skipped (ε figure still drawn)')
+                print('  [note] trace lacks pid/seg columns — ε overlay and '
+                      'suspended blocks on breakdown/Gantt skipped '
+                      '(ε figure still drawn)')
         plot_taskset_mort(ts_gcaps, ts_tsg, out)
         plot_taskset_breakdown(ts_gcaps, ts_tsg, out, ts_eps)
         plot_taskset_response_overhead(ts_gcaps, ts_tsg, out)
         plot_taskset_gantt(ts_gcaps, ts_tsg, out, args.gantt_inches_per_sec,
-                           args.gantt_start, args.gantt_duration, ts_eps)
+                           args.gantt_start, args.gantt_duration, ts_eps,
+                           ts_susp)
 
     if not any((sweep_gcaps, sweep_tsg, ts_gcaps, ts_tsg)):
         print('No input CSVs found — run the bench binaries first.')
