@@ -1,0 +1,133 @@
+#!/bin/bash
+# switch-nvgpu — select the GCAPS or stock nvgpu driver on JetPack 7.2 (r39.2).
+#
+# Unlike the R35 version this can swap the driver LIVE (rmmod + modprobe) when
+# nothing holds the GPU, instead of requiring a reboot.  It also reports which
+# variant is actually RUNNING, not merely which file is staged.
+#
+# Install to /usr/local/bin/switch-nvgpu (chmod +x).  Requires the side-by-side
+# nvgpu_{gcaps,original}.ko staged in /lib/modules/$(uname -r)/updates/.
+
+set -u
+
+KVER=$(uname -r)
+MODPATH=/lib/modules/$KVER/updates
+ACTIVE=$MODPATH/nvgpu.ko
+GCAPS=$MODPATH/nvgpu_gcaps.ko
+ORIG=$MODPATH/nvgpu_original.ko
+
+# Symbol present only in the GCAPS build — the ground truth for "what is
+# actually loaded right now".
+GCAPS_SYM=nvgpu_ioctl_runlist_update_rt_prio
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+need_staged() {
+	[ -f "$GCAPS" ] || die "missing $GCAPS (stage it first — see gcaps_build_procedure_jp72.md Step 5)"
+	[ -f "$ORIG" ]  || die "missing $ORIG (stage it first — see gcaps_build_procedure_jp72.md Step 5)"
+}
+
+# Which variant is loaded in the kernel right now?
+running_variant() {
+	if ! lsmod | grep -q '^nvgpu '; then
+		echo "not-loaded"
+	elif sudo grep -qw "$GCAPS_SYM" /proc/kallsyms 2>/dev/null; then
+		echo "GCAPS"
+	else
+		echo "original"
+	fi
+}
+
+# Which variant is staged as the file modprobe will load next?
+staged_variant() {
+	if   cmp -s "$ACTIVE" "$GCAPS"; then echo "GCAPS"
+	elif cmp -s "$ACTIVE" "$ORIG";  then echo "original"
+	else echo "unknown"; fi
+}
+
+refcount() {
+	local rc
+	rc=$(awk '$1=="nvgpu" {print $3}' /proc/modules 2>/dev/null)
+	echo "${rc:-n/a}"
+}
+
+holders() {
+	echo "  processes with the GPU open:"
+	sudo fuser -v /dev/nvhost-* /dev/nvgpu* 2>/dev/null | sed 's/^/    /' || true
+	echo "  (stop CUDA processes, or reboot to switch)"
+}
+
+live_swap() {
+	local rc
+	rc=$(refcount)
+	if [ "$rc" != "0" ]; then
+		echo "nvgpu is busy (refcount $rc) — cannot swap live."
+		holders
+		return 1
+	fi
+
+	echo "unloading nvgpu..."
+	sudo rmmod nvgpu || { echo "rmmod failed."; holders; return 1; }
+	echo "loading nvgpu..."
+	sudo modprobe nvgpu || die "modprobe nvgpu failed — check 'dmesg | tail -30'. \
+Recover with: sudo cp $ORIG $ACTIVE && sudo depmod -a && sudo modprobe nvgpu"
+	return 0
+}
+
+select_variant() {
+	local want=$1 src=$2
+	need_staged
+	sudo cp "$src" "$ACTIVE" || die "could not stage $src"
+	sudo depmod -a || die "depmod failed"
+	echo "Staged: $want"
+
+	if [ "$LIVE" = "no" ]; then
+		echo "Reboot to load it (or re-run without --no-live)."
+		return 0
+	fi
+
+	if live_swap; then
+		echo "Now running: $(running_variant)"
+		echo "NOTE: restart any CUDA processes — their old context is gone."
+	else
+		echo "Staged only; reboot to activate."
+		return 1
+	fi
+}
+
+usage() {
+	cat <<'EOF'
+Usage: switch-nvgpu [gcaps|original|status|reload] [--no-live]
+
+  gcaps      stage the GCAPS driver and (by default) swap it in live
+  original   stage the stock driver and (by default) swap it in live
+  status     show staged vs. running variant
+  reload     rmmod + modprobe the currently staged variant
+  --no-live  stage only; activate on next reboot
+EOF
+}
+
+LIVE=yes
+CMD=""
+for a in "$@"; do
+	case "$a" in
+		--no-live) LIVE=no ;;
+		*) [ -z "$CMD" ] && CMD="$a" ;;
+	esac
+done
+set -- "$CMD"
+
+case "${1:-}" in
+	gcaps)    select_variant GCAPS "$GCAPS" ;;
+	original) select_variant original "$ORIG" ;;
+	reload)   live_swap && echo "Now running: $(running_variant)" ;;
+	status)
+		echo "kernel:  $KVER"
+		echo "staged:  $(staged_variant)   ($ACTIVE)"
+		echo "running: $(running_variant)  (refcount $(refcount))"
+		if [ "$(staged_variant)" != "$(running_variant)" ]; then
+			echo "NOTE: staged != running — reboot or 'switch-nvgpu reload' to reconcile."
+		fi
+		;;
+	*) usage; exit 1 ;;
+esac
