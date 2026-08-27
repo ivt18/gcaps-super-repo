@@ -409,6 +409,20 @@ static int nvgpu_ioctl_runlist_update_rt_prio(struct gk20a *g,
 
 	caller_prio = gcaps_rt_prio_of(cpid);
 
+	/* GCAPS: take a GPU power reference before touching runlist registers.
+	 * Every other register-touching handler in this file does this; the R35
+	 * patch did not.  With railgating enabled the GPU powers down between
+	 * segments and the runlist write lands in an unmapped BAR ("Attempted
+	 * access to GPU regs after unmapping"), corrupting driver state: later
+	 * ioctls return -ENODEV and the Tegra watchdog resets the board.
+	 * Taken OUTSIDE cs_lock so a GPU power-up cannot extend the critical
+	 * section (that would inflate the blocking term in the analysis). */
+	err = gk20a_busy(g);
+	if (err != 0) {
+		nvgpu_err(g, "failed to power on gpu for runlist update");
+		goto out_free;
+	}
+
 	rt_mutex_lock(&sched->cs_lock);
 	start_time = ktime_get();
 
@@ -562,6 +576,7 @@ done:
 		add_req ? 1 : 0, rl_updated ? 1 : 0, elapsed_time,
 		preempted_pid, resumed_pid);
 	rt_mutex_unlock(&sched->cs_lock);
+	gk20a_idle(g);
 
 out_free:
 	/* the R35 version never freed these - a leak on every ioctl */
