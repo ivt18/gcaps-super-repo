@@ -153,9 +153,6 @@ static int gk20a_sched_rl_ctrl_init(struct gk20a *g)
 	if (rl_ctrl->curr_tsgs_in_rl == NULL)
 		goto free_pending;
 
-	*rl_ctrl->tsg_running = 0;
-	*rl_ctrl->tsg_pending = 0;
-	*rl_ctrl->curr_tsgs_in_rl = 0;
 
 	rl_ctrl->rt_task_in_rl.pid = RL_CTRL_NO_RT_PID;
 	rl_ctrl->rt_task_in_rl.rt_prio = RL_CTRL_NO_RT_PRIO;
@@ -316,11 +313,12 @@ static void nvgpu_get_tsgs_with_highest_prio_locked(struct gk20a *g,
 	struct nvgpu_fifo *f = &g->fifo;
 	struct nvgpu_sched_ctrl *sched = &g->sched_ctrl;
 	struct nvgpu_tsg *tsg;
+	unsigned int nbits = f->num_channels;
 	int prio_highest = 0;
 	unsigned int i;
 
 	*pid_next = -1;
-	*tsgs_next = 0;
+	bitmap_zero(tsgs_next, nbits);
 	*rt_prio_next = 0;
 
 	for (i = 0; i < f->num_channels; i++) {
@@ -366,6 +364,7 @@ static int nvgpu_ioctl_runlist_update_rt_prio(struct gk20a *g,
 	unsigned long *new_tsg_in_rl;
 	unsigned long *tsgs_cpid;
 	unsigned long *tsgs_next;
+	unsigned int nbits = f->num_channels;
 	pid_t cpid = args->pid;
 	bool add_req = args->add_req;
 	bool sync_mode = args->sync_mode;
@@ -403,9 +402,7 @@ static int nvgpu_ioctl_runlist_update_rt_prio(struct gk20a *g,
 		goto out_free;
 	}
 
-	*new_tsg_in_rl = 0;
-	*tsgs_cpid = 0;
-	*tsgs_next = 0;
+	bitmap_zero(tsgs_next, nbits);
 
 	caller_prio = gcaps_rt_prio_of(cpid);
 
@@ -446,25 +443,33 @@ static int nvgpu_ioctl_runlist_update_rt_prio(struct gk20a *g,
 		if (caller_prio <= 0) {
 			/* best-effort caller */
 			if (rt_task_in_rl->pid == RL_CTRL_NO_RT_PID) {
-				*rl_ctrl->tsg_running |= *tsgs_cpid;
-				*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
+				bitmap_or(rl_ctrl->tsg_running, rl_ctrl->tsg_running,
+						tsgs_cpid, nbits);
+				bitmap_andnot(rl_ctrl->tsg_pending, rl_ctrl->tsg_pending,
+						tsgs_cpid, nbits);
 			} else {
-				*rl_ctrl->tsg_pending |= *tsgs_cpid;
-				*rl_ctrl->tsg_running &= ~(*tsgs_cpid);
+				bitmap_or(rl_ctrl->tsg_pending, rl_ctrl->tsg_pending,
+						tsgs_cpid, nbits);
+				bitmap_andnot(rl_ctrl->tsg_running, rl_ctrl->tsg_running,
+						tsgs_cpid, nbits);
 			}
 		} else {
 			/* RT caller.  Equal priorities keep FIFO order (no
 			 * interleaving), so the test is strictly greater. */
 			if (caller_prio > rt_task_in_rl->rt_prio) {
 				preempted_pid = rt_task_in_rl->pid;
-				*rl_ctrl->tsg_pending |= *rl_ctrl->tsg_running;
-				*rl_ctrl->tsg_running = *tsgs_cpid;
-				*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
+				bitmap_or(rl_ctrl->tsg_pending, rl_ctrl->tsg_pending,
+						rl_ctrl->tsg_running, nbits);
+				bitmap_copy(rl_ctrl->tsg_running, tsgs_cpid, nbits);
+				bitmap_andnot(rl_ctrl->tsg_pending, rl_ctrl->tsg_pending,
+						tsgs_cpid, nbits);
 				rt_task_in_rl->pid = cpid;
 				rt_task_in_rl->rt_prio = caller_prio;
 			} else {
-				*rl_ctrl->tsg_pending |= *tsgs_cpid;
-				*rl_ctrl->tsg_running &= ~(*tsgs_cpid);
+				bitmap_or(rl_ctrl->tsg_pending, rl_ctrl->tsg_pending,
+						tsgs_cpid, nbits);
+				bitmap_andnot(rl_ctrl->tsg_running, rl_ctrl->tsg_running,
+						tsgs_cpid, nbits);
 			}
 		}
 	} else {
@@ -472,23 +477,28 @@ static int nvgpu_ioctl_runlist_update_rt_prio(struct gk20a *g,
 						&rt_prio_next, tsgs_next);
 		if (pid_next > 0) {
 			if (pid_next == cpid) {
-				*rl_ctrl->tsg_pending &= ~(*tsgs_next);
-				*rl_ctrl->tsg_running &= ~(*tsgs_next);
-				if (*rl_ctrl->tsg_running == 0) {
+				bitmap_andnot(rl_ctrl->tsg_pending, rl_ctrl->tsg_pending,
+						tsgs_next, nbits);
+				bitmap_andnot(rl_ctrl->tsg_running, rl_ctrl->tsg_running,
+						tsgs_next, nbits);
+				if (bitmap_empty(rl_ctrl->tsg_running, nbits)) {
 					rt_task_in_rl->pid = RL_CTRL_NO_RT_PID;
 					rt_task_in_rl->rt_prio =
 						RL_CTRL_NO_RT_PRIO;
 				}
 			} else {
 				resumed_pid = pid_next;
-				*rl_ctrl->tsg_running = *tsgs_next;
-				*rl_ctrl->tsg_pending &= ~(*tsgs_next);
+				bitmap_copy(rl_ctrl->tsg_running, tsgs_next, nbits);
+				bitmap_andnot(rl_ctrl->tsg_pending, rl_ctrl->tsg_pending,
+						tsgs_next, nbits);
 				rt_task_in_rl->pid = pid_next;
 				rt_task_in_rl->rt_prio = rt_prio_next;
 			}
 		} else {
-			*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
-			*rl_ctrl->tsg_running &= ~(*tsgs_cpid);
+			bitmap_andnot(rl_ctrl->tsg_pending, rl_ctrl->tsg_pending,
+					tsgs_cpid, nbits);
+			bitmap_andnot(rl_ctrl->tsg_running, rl_ctrl->tsg_running,
+					tsgs_cpid, nbits);
 
 			for (i = 0; i < f->num_channels; i++) {
 				struct nvgpu_tsg *tsg = &f->tsg[i];
@@ -510,54 +520,73 @@ static int nvgpu_ioctl_runlist_update_rt_prio(struct gk20a *g,
 			}
 
 			if (!exist) {
-				*rl_ctrl->tsg_running = *rl_ctrl->tsg_pending;
-				*rl_ctrl->tsg_pending = 0;
+				bitmap_copy(rl_ctrl->tsg_running, rl_ctrl->tsg_pending, nbits);
+				bitmap_zero(rl_ctrl->tsg_pending, nbits);
 				rt_task_in_rl->pid = RL_CTRL_NO_RT_PID;
 				rt_task_in_rl->rt_prio = RL_CTRL_NO_RT_PRIO;
 			}
 		}
 	}
 
-	if ((*rl_ctrl->tsg_running & *rl_ctrl->tsg_pending) != 0)
+	if (bitmap_intersects(rl_ctrl->tsg_running,
+			rl_ctrl->tsg_pending, nbits))
 		nvgpu_warn(g, "running and pending tsgs are not exclusive");
 
 	/* OR, not assign: the exception TSGs are already set */
-	*new_tsg_in_rl |= *rl_ctrl->tsg_running;
+	bitmap_or(new_tsg_in_rl, new_tsg_in_rl,
+			rl_ctrl->tsg_running, nbits);
 
-	if (*new_tsg_in_rl != *rl_ctrl->curr_tsgs_in_rl) {
-		rl_updated = true;
-		for (i = 0; i < f->num_channels; i++) {
-			struct nvgpu_tsg *tsg = &f->tsg[i];
-			struct nvgpu_channel *ch;
-			bool add = nvgpu_test_bit(i, new_tsg_in_rl);
+	/* GCAPS: the R35 original gated the entire hardware update on its own
+	 * cache:
+	 *     if (*new_tsg_in_rl != *rl_ctrl->curr_tsgs_in_rl) { ... }
+	 * curr_tsgs_in_rl is a PRIVATE shadow of runlist membership, but the
+	 * authoritative state (domain->active_channels) is also mutated by the
+	 * normal nvgpu channel path - nvgpu_channel_enable/disable and
+	 * nvgpu_runlist_reload_ids - which GCAPS never hooks.  Once the shadow
+	 * goes stale, GCAPS can compute "no change needed" and SKIP a reload that
+	 * WAS required: the TSG is left off the runlist, its kernel never
+	 * dispatches, and its gcapsGpuSegEnd blocks on a GPU fence forever.
+	 * See gcaps-super-repo/runlist-cache-desync-bug.md.
+	 *
+	 * Reconcile UNCONDITIONALLY.  nvgpu_runlist_update() early-outs when a
+	 * channel's bit is already in the requested state, so the extra calls are
+	 * cheap, and correctness stops depending on a cache that cannot be kept
+	 * coherent.  curr_tsgs_in_rl is retained ONLY so rlupd= still reports
+	 * whether GCAPS INTENDED a membership change - the field
+	 * measure_preempt_overhead.py keys on. */
+	rl_updated = (*new_tsg_in_rl != *rl_ctrl->curr_tsgs_in_rl);
 
-			/* GCAPS: the R35 original walked EVERY tsg slot here,
-			 * including torn-down ones, dereferencing tsg->runlist
-			 * and iterating tsg->ch_list on them.  Both other loops
-			 * in this function gate on active_tsg_bitmap; this one
-			 * did not.  A stale slot is a use-after-free walk under
-			 * the runlist lock.  Inactive TSGs are not in our
-			 * bitmaps anyway, so skipping them cannot change which
-			 * TSGs GCAPS intends to schedule. */
-			if (!NVGPU_SCHED_ISSET(tsg->tsgid,
-					sched->active_tsg_bitmap))
-				continue;
-			if (tsg->runlist == NULL)
-				continue;
+	for (i = 0; i < f->num_channels; i++) {
+		struct nvgpu_tsg *tsg = &f->tsg[i];
+		struct nvgpu_channel *ch;
+		bool add = nvgpu_test_bit(i, new_tsg_in_rl);
 
-			nvgpu_list_for_each_entry(ch, &tsg->ch_list,
-					nvgpu_channel, ch_entry) {
-				/* runlist lock is taken inside */
-				err = g->ops.runlist.update(g, tsg->runlist,
-						ch, add, true);
-				if (err < 0) {
-					nvgpu_err(g, "runlist update failed");
-					goto done;
-				}
+		/* GCAPS: the R35 original walked EVERY tsg slot here,
+		 * including torn-down ones, dereferencing tsg->runlist
+		 * and iterating tsg->ch_list on them.  Both other loops
+		 * in this function gate on active_tsg_bitmap; this one
+		 * did not.  A stale slot is a use-after-free walk under
+		 * the runlist lock.  Inactive TSGs are not in our
+		 * bitmaps anyway, so skipping them cannot change which
+		 * TSGs GCAPS intends to schedule. */
+		if (!NVGPU_SCHED_ISSET(tsg->tsgid,
+				sched->active_tsg_bitmap))
+			continue;
+		if (tsg->runlist == NULL)
+			continue;
+
+		nvgpu_list_for_each_entry(ch, &tsg->ch_list,
+				nvgpu_channel, ch_entry) {
+			/* runlist lock is taken inside */
+			err = g->ops.runlist.update(g, tsg->runlist,
+					ch, add, true);
+			if (err < 0) {
+				nvgpu_err(g, "runlist update failed");
+				goto done;
 			}
 		}
-		*rl_ctrl->curr_tsgs_in_rl = *new_tsg_in_rl;
 	}
+	bitmap_copy(rl_ctrl->curr_tsgs_in_rl, new_tsg_in_rl, nbits);
 
 done:
 	stop_time = ktime_get();
@@ -605,7 +634,7 @@ def patch_ioctl_c(text):
         if anchor not in text:
             raise LookupError("could not find %r in %s" % (anchor, IOCTL_C))
         text = text.replace(
-            anchor, anchor + "\n#include <nvgpu/runlist.h>	/* GCAPS */", 1)
+            anchor, anchor + "\n#include <nvgpu/runlist.h>	/* GCAPS */\n#include <linux/bitmap.h>	/* GCAPS */", 1)
 
     anchor_fn = "long gk20a_ctrl_dev_ioctl(struct file *filp"
     i = text.find(anchor_fn)
