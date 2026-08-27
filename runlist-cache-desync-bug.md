@@ -143,5 +143,35 @@ Not applied here. The cache must not be allowed to suppress a needed update:
 - **Or:** invalidate / refresh `curr_tsgs_in_rl` whenever the normal path changes
   the runlist (would require hooking the channel enable/disable path).
 
-Workaround for data collection without a driver change: use the longest duration
-that reliably completes (bisect from `-d 10`) and/or aggregate several short runs.
+## Workarounds for data collection (no driver change)
+
+The race needs a normal-path runlist write to land between two GCAPS ioctls, so
+the hit probability accumulates with the **number of GPU segments executed**.
+Both knobs below reduce that count. Neither eliminates the race — they lower
+the per-run probability, so treat a clean run as a sample, not a proof.
+
+**1. Fewer tasks.** Each active GPU task contributes its own add/remove cycle
+per period, so segment rate falls roughly linearly with task count. `main` has
+no `-k` flag (that is `workloadTasksetGcaps`); reduce by passing a smaller CSV:
+
+```bash
+head -5 taskset.csv > taskset_4.csv     # header + tasks 1-4
+sudo ./run_gcaps.sh -f taskset_4.csv -d 10 -i 1
+```
+
+Bisect upward until it becomes unreliable, then report at the largest task
+count that completes consistently. Keep the same subset across compared
+series — dropping a task changes the taskset, so GCAPS and TSG-baseline arms
+must use the *identical* CSV.
+
+**2. Shorter duration.** Use the longest `-d` that reliably completes (bisect
+from `-d 10`) and/or aggregate several short runs.
+
+> **Cheap to iterate on since 2026-08-27.** This deadlock used to be masked by
+> a far worse failure — the missing `gk20a_busy()` power reference, which let
+> the ioctl write registers on a railgated GPU and hard-reset the board. With
+> railgating disabled (see `gcaps_userspace/run_gcaps.sh`) the board stays up
+> and this deadlock costs only a `Ctrl-C`, which makes bisecting practical.
+> Signature: every task blocked in `cudaEventSynchronize`, `GCAPS_EV` shows
+> only `add=1` events and never an `add=0`, highest-priority task holds the
+> runlist, `dmesg` clean.

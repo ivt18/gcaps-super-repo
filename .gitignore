@@ -58,4 +58,8 @@ patches
 files_src
 
 # Python
-*/__pycache__
+__pycache__/
+*.cuda12-orig
+*.errno-orig
+gcaps_userspace/main
+gcaps_userspace/timelog/

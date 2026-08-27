@@ -24,6 +24,21 @@
 
 #include <helper_string.h>
 
+/* GCAPS_CUDA13_COMPAT: CUDA 13 removed cudaDeviceProp::computeMode and ::clockRate. */
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+static inline int helper_clock_rate_khz(int dev)
+{
+  int v = 0;
+  cudaDeviceGetAttribute(&v, cudaDevAttrClockRate, dev);
+  return v;
+}
+#define HELPER_COMPUTE_MODE(p)      (cudaComputeModeDefault)
+#define HELPER_CLOCK_RATE(p, dev)   helper_clock_rate_khz(dev)
+#else
+#define HELPER_COMPUTE_MODE(p)      ((p).computeMode)
+#define HELPER_CLOCK_RATE(p, dev)   ((p).clockRate)
+#endif
+
 #ifndef EXIT_WAIVED
 #define EXIT_WAIVED 2
 #endif
@@ -678,7 +693,7 @@ inline int gpuDeviceInit(int devID) {
   cudaDeviceProp deviceProp;
   checkCudaErrors(cudaGetDeviceProperties(&deviceProp, devID));
 
-  if (deviceProp.computeMode == cudaComputeModeProhibited) {
+  if (HELPER_COMPUTE_MODE(deviceProp) == cudaComputeModeProhibited) {
     fprintf(stderr,
             "Error: device is running in <Compute Mode "
             "Prohibited>, no threads can use cudaSetDevice().\n");
@@ -722,7 +737,7 @@ inline int gpuGetMaxGflopsDeviceId() {
 
     // If this GPU is not running on Compute Mode prohibited,
     // then we can add it to the list
-    if (deviceProp.computeMode != cudaComputeModeProhibited) {
+    if (HELPER_COMPUTE_MODE(deviceProp) != cudaComputeModeProhibited) {
       if (deviceProp.major == 9999 && deviceProp.minor == 9999) {
         sm_per_multiproc = 1;
       } else {
@@ -731,7 +746,7 @@ inline int gpuGetMaxGflopsDeviceId() {
       }
 
       uint64_t compute_perf = (uint64_t)deviceProp.multiProcessorCount *
-                              sm_per_multiproc * deviceProp.clockRate;
+                              sm_per_multiproc * HELPER_CLOCK_RATE(deviceProp, current_device);
 
       if (compute_perf > max_compute_perf) {
         max_compute_perf = compute_perf;
@@ -806,7 +821,7 @@ inline int findIntegratedGPU() {
     // If GPU is integrated and is not running on Compute Mode prohibited,
     // then cuda can map to GLES resource
     if (deviceProp.integrated &&
-        (deviceProp.computeMode != cudaComputeModeProhibited)) {
+        (HELPER_COMPUTE_MODE(deviceProp) != cudaComputeModeProhibited)) {
       checkCudaErrors(cudaSetDevice(current_device));
       checkCudaErrors(cudaGetDeviceProperties(&deviceProp, current_device));
       printf("GPU Device %d: \"%s\" with compute capability %d.%d\n\n",

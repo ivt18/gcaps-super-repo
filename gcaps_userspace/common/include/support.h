@@ -1,6 +1,9 @@
 #ifndef __SUPPORT_H__
 #define __SUPPORT_H__
 
+#include <errno.h>
+#include <string.h>
+#include <cstdio>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -106,6 +109,13 @@ extern mytimer_t overhead_timer;
 		/* overhead_timer.record_start(); \ */ \
 		int _err = ioctl(_fd, NVGPU_GPU_IOCTL_RUNLIST_UPDATE_RT_PRIO, &_ioctl_args); \
 		/* overhead_timer.record_stop(); \ */ \
+		if (_err < 0) { /* GCAPS_IOCTL_DIAG */ \
+			fprintf(stderr, "GCAPS ioctl FAILED at %s:%d pid=%d add=%d "\
+				"rc=%d errno=%d (%s)\n", __FILE__, __LINE__, \
+				(int)_ioctl_args.pid, (int)_ioctl_args.add_req, \
+				_err, errno, strerror(errno)); \
+			fflush(stderr); \
+		} \
 		assert(_err >= 0); \
 	} else { \
 		cudaEventRecord(start, stream); \
@@ -123,6 +133,13 @@ extern mytimer_t overhead_timer;
 		/* overhead_timer.record_start(); \ */\
 		int _err = ioctl(_fd, NVGPU_GPU_IOCTL_RUNLIST_UPDATE_RT_PRIO, &_ioctl_args); \
 		/* overhead_timer.record_stop(); \ */\
+		if (_err < 0) { /* GCAPS_IOCTL_DIAG */ \
+			fprintf(stderr, "GCAPS ioctl FAILED at %s:%d pid=%d add=%d "\
+				"rc=%d errno=%d (%s)\n", __FILE__, __LINE__, \
+				(int)_ioctl_args.pid, (int)_ioctl_args.add_req, \
+				_err, errno, strerror(errno)); \
+			fflush(stderr); \
+		} \
 		assert(_err >= 0); \
 	} else { \
 		cudaEventRecord(stop, stream); \

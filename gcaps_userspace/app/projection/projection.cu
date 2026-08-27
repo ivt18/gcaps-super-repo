@@ -18,6 +18,14 @@
 #include <helper_cuda.h>
 #include <helper_functions.h>
 
+/* GCAPS_CUDA13_COMPAT: on CUDA 13 cuCtxCreate resolves to cuCtxCreate_v4, which takes a
+ * CUctxCreateParams* as its second argument. */
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13000
+#define cuCtxCreateCompat(pctx, flags, dev) cuCtxCreate((pctx), NULL, (flags), (dev))
+#else
+#define cuCtxCreateCompat(pctx, flags, dev) cuCtxCreate((pctx), (flags), (dev))
+#endif
+
 __global__ void projectPoints(float *d_input, float *d_output, int num_points, float f) {
 	__dummy_kernel_prologue(50);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -86,7 +94,7 @@ Projection::Projection(int num_points_, float focal_length_, int fd_, bool sync_
 void Projection::taskInit() {
 	cuInit(0);
 	cuDeviceGet(&device, 0);
-	cuCtxCreate(&ctx, 0, device);
+	cuCtxCreateCompat(&ctx, 0, device);
 
 	checkCudaErrors(cudaMallocHost((void **)&h_input, sizeof(float) * 3 * num_points));
 	checkCudaErrors(cudaMallocHost((void **)&h_output, sizeof(float) * 2 * num_points));

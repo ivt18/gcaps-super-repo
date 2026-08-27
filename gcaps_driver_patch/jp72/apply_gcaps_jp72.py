@@ -267,7 +267,20 @@ static int gcaps_rt_prio_of(pid_t pid)
  */
 static bool gcaps_is_except_proc(pid_t tgid)
 {
-	static const char * const except[] = { "Xorg", "gnome-shell", "Xwayland" };
+	/* Verified on the JP 7.2 box (GNOME/X11, Ubuntu 24.04): the processes
+	 * actually holding nvgpu fds are Xorg, gnome-shell and mutter-x11-frames.
+	 * mutter-x11-frames is a SEPARATE process only since GNOME 43 - on the
+	 * R35 board's Ubuntu 20.04 it lived inside gnome-shell, which is why the
+	 * original two-entry list was complete there and is NOT here.  Evicting
+	 * it mid-render is what makes runlist.update(wait_for_finish=true) time
+	 * out and escalate to gv11b_fifo_recover.
+	 *
+	 * task->comm is truncated to TASK_COMM_LEN-1 (15) chars, so
+	 * "mutter-x11-frames" shows up as "mutter-x11-fram".  strncmp over that
+	 * length lets full names be listed here and still match. */
+	static const char * const except[] = {
+		"Xorg", "gnome-shell", "Xwayland", "mutter-x11-frames",
+	};
 	struct task_struct *t;
 	char comm[TASK_COMM_LEN];
 	unsigned int k;
@@ -284,7 +297,7 @@ static bool gcaps_is_except_proc(pid_t tgid)
 		return false;
 
 	for (k = 0; k < ARRAY_SIZE(except); k++) {
-		if (strcmp(except[k], comm) == 0)
+		if (strncmp(except[k], comm, TASK_COMM_LEN - 1) == 0)
 			return true;
 	}
 
@@ -503,6 +516,20 @@ static int nvgpu_ioctl_runlist_update_rt_prio(struct gk20a *g,
 			struct nvgpu_tsg *tsg = &f->tsg[i];
 			struct nvgpu_channel *ch;
 			bool add = nvgpu_test_bit(i, new_tsg_in_rl);
+
+			/* GCAPS: the R35 original walked EVERY tsg slot here,
+			 * including torn-down ones, dereferencing tsg->runlist
+			 * and iterating tsg->ch_list on them.  Both other loops
+			 * in this function gate on active_tsg_bitmap; this one
+			 * did not.  A stale slot is a use-after-free walk under
+			 * the runlist lock.  Inactive TSGs are not in our
+			 * bitmaps anyway, so skipping them cannot change which
+			 * TSGs GCAPS intends to schedule. */
+			if (!NVGPU_SCHED_ISSET(tsg->tsgid,
+					sched->active_tsg_bitmap))
+				continue;
+			if (tsg->runlist == NULL)
+				continue;
 
 			nvgpu_list_for_each_entry(ch, &tsg->ch_list,
 					nvgpu_channel, ch_entry) {

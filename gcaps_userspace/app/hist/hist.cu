@@ -16,6 +16,14 @@
 #include <helper_cuda.h>
 #include <helper_functions.h>
 
+/* GCAPS_CUDA13_COMPAT: on CUDA 13 cuCtxCreate resolves to cuCtxCreate_v4, which takes a
+ * CUctxCreateParams* as its second argument. */
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13000
+#define cuCtxCreateCompat(pctx, flags, dev) cuCtxCreate((pctx), NULL, (flags), (dev))
+#else
+#define cuCtxCreateCompat(pctx, flags, dev) cuCtxCreate((pctx), (flags), (dev))
+#endif
+
 #define BLOCK_SIZE 512
 
 __global__ void histogram_kernel(unsigned int* input, unsigned int* bins, unsigned int num_elements, unsigned int num_bins) {
@@ -53,7 +61,7 @@ Hist::Hist(unsigned int n_elements, unsigned int n_bins, int fd_,  bool sync_mod
 void Hist::taskInit() {
 	cuInit(0);
     cuDeviceGet(&device, 0);
-    cuCtxCreate(&ctx, 0, device);
+    cuCtxCreateCompat(&ctx, 0, device);
 
 	if (event_flags != 0) {
         checkCudaErrors(cudaEventCreateWithFlags(&start, event_flags));

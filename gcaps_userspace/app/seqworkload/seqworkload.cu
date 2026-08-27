@@ -18,6 +18,14 @@
 #include <helper_cuda.h>
 #include <helper_functions.h>
 
+/* GCAPS_CUDA13_COMPAT: on CUDA 13 cuCtxCreate resolves to cuCtxCreate_v4, which takes a
+ * CUctxCreateParams* as its second argument. */
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13000
+#define cuCtxCreateCompat(pctx, flags, dev) cuCtxCreate((pctx), NULL, (flags), (dev))
+#else
+#define cuCtxCreateCompat(pctx, flags, dev) cuCtxCreate((pctx), (flags), (dev))
+#endif
+
 // ============================================================================
 // Ported kernels (singleTaskSched bench/workloads.cuh, SequenceScheduler
 // plumbing removed — plain device pointers, identical math/launch geometry).
@@ -263,7 +271,7 @@ void SeqWorkload::taskInit()
 	 * stream sync, which the per-event blocking flag does not cover. Critical
 	 * under SCHED_FIFO + sched_rt_runtime_us=-1: a spinning RT wait can starve
 	 * the nvgpu driver thread and wedge the GPU. */
-	cuCtxCreate(&ctx, suspend_ ? CU_CTX_SCHED_BLOCKING_SYNC : 0, device);
+	cuCtxCreateCompat(&ctx, suspend_ ? CU_CTX_SCHED_BLOCKING_SYNC : 0, device);
 
 	/* macro-bracket events follow the native apps' timing-disable convention */
 	if (event_flags != 0) {
