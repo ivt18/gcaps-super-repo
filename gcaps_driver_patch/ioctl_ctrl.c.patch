@@ -9,7 +9,7 @@
  #include <nvgpu/pmu/therm.h>
  #include <nvgpu/power_features/pg.h>
 \ No newline at end of file
-@@ -2222,7 +2223,296 @@
+@@ -2222,7 +2223,312 @@
  
  	return err;
  }
@@ -215,11 +215,27 @@
 +					rt_task_in_rl->pid = RL_CTRL_NO_RT_PID;
 +					rt_task_in_rl->rt_prio = RL_CTRL_NO_RT_PRIO;
 +				}
++			}else if ((*rl_ctrl->tsg_running & *tsgs_cpid) == 0) {
++				/* The caller has already been preempted: the preemptor is
++				 * still running and outranks every pending task, so this
++				 * segment-end changes nothing about who should be on the
++				 * runlist.  Drop only the caller's own bits.
++				 *
++				 * Falling through to the branch below would OVERWRITE
++				 * tsg_running with the next pending task, evicting the
++				 * running preemptor mid-kernel and deadlocking it on its
++				 * fence.  See preempted-caller-runlist-overwrite-bug.md */
++				*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
 +			}else {
 +				task_next = pid_task(find_vpid(pid_next), PIDTYPE_PID);
 +				resumed_pid = pid_next; /* this task is resumed back into the runlist */
-+				/* found the next rt task of #op_type, add ONLY this task to runlists */
-+				*rl_ctrl->tsg_running = *tsgs_next;
++				/* Found the next rt task of #op_type: remove the CALLER and
++				 * admit that task.  Set difference + union, never a wholesale
++				 * assignment -- the caller is not necessarily the only entry
++				 * in tsg_running. */
++				*rl_ctrl->tsg_running &= ~(*tsgs_cpid);
++				*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
++				*rl_ctrl->tsg_running |= *tsgs_next;
 +				*rl_ctrl->tsg_pending &= ~(*tsgs_next);
 +				rt_task_in_rl->pid = pid_next;
 +				rt_task_in_rl->rt_prio = rt_prio_next;
@@ -307,7 +323,7 @@
  {
  	struct gk20a_ctrl_priv *priv = filp->private_data;
 \ No newline at end of file
-@@ -2596,6 +2860,11 @@
+@@ -2596,6 +2876,11 @@
  		err = nvgpu_gpu_ioctl_get_buffer_info(g,
  			(struct nvgpu_gpu_get_buffer_info_args *)buf);
  		break;
