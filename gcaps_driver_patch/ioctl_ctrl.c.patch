@@ -9,10 +9,74 @@
  #include <nvgpu/pmu/therm.h>
  #include <nvgpu/power_features/pg.h>
 \ No newline at end of file
-@@ -2222,7 +2223,312 @@
+@@ -2222,7 +2223,397 @@
  
  	return err;
  }
++
++/*
++ * GCAPS: RCU-safe pid -> rt_priority.
++ *
++ * The published patch called pid_task(find_vpid(...)) bare, and held the
++ * resulting task_struct * across the SLEEPING runlist reload.  Both are
++ * use-after-free hazards and splat under CONFIG_PROVE_RCU.  The lookups
++ * cannot be wrapped in one long rcu_read_lock() precisely because this ioctl
++ * sleeps, so each one copies out what it needs under a short read-side
++ * section instead.
++ *
++ * Returns GCAPS_NO_PRIO when the task has exited; every caller treats that as
++ * "not a real-time task", which is the conservative direction.
++ */
++#define GCAPS_NO_PRIO (-1)
++
++static int gcaps_rt_prio_of(pid_t pid)
++{
++	struct task_struct *t;
++	int prio = GCAPS_NO_PRIO;
++
++	rcu_read_lock();
++	t = pid_task(find_vpid(pid), PIDTYPE_PID);
++	if (t != NULL)
++		prio = (int)t->rt_priority;
++	rcu_read_unlock();
++
++	return prio;
++}
++
++/*
++ * GCAPS: is this tgid a desktop-compositor process that must never be evicted
++ * from the runlist?  Copies comm out under RCU rather than returning a
++ * borrowed task_struct *.
++ *
++ * task->comm is truncated to TASK_COMM_LEN-1 chars, so compare over that
++ * length.  On the R35 board (Ubuntu 20.04) mutter runs inside gnome-shell, so
++ * these two names are complete; GNOME 43+ splits out "mutter-x11-frames" and
++ * would need it added here.
++ */
++static bool gcaps_is_except_proc(pid_t tgid)
++{
++	static const char * const except[] = { "Xorg", "gnome-shell" };
++	struct task_struct *t;
++	char comm[TASK_COMM_LEN];
++	unsigned int k;
++
++	comm[0] = '\0';
++
++	rcu_read_lock();
++	t = pid_task(find_vpid(tgid), PIDTYPE_PID);
++	if (t != NULL)
++		strscpy(comm, t->comm, sizeof(comm));
++	rcu_read_unlock();
++
++	if (comm[0] == '\0')
++		return false;
++
++	for (k = 0; k < ARRAY_SIZE(except); k++) {
++		if (strncmp(except[k], comm, TASK_COMM_LEN - 1) == 0)
++			return true;
++	}
++	return false;
++}
 +
 +/**
 + * Description: get the task and its tsgs with the highest priority from pending tsgs
@@ -27,7 +91,6 @@
 +	struct nvgpu_fifo *f = &g->fifo;
 +	struct nvgpu_sched_ctrl *sched = &g->sched_ctrl;
 +	struct nvgpu_tsg *tsg;
-+	struct task_struct *task;
 +	int prio_highest = 0;
 +	int i = 0;
 +
@@ -42,9 +105,10 @@
 +		}
 +		/* tsg in pending list */
 +		if (nvgpu_test_bit(i, sched->rl_ctrl.tsg_pending)) {
-+			task = pid_task(find_vpid(tsg->tgid), PIDTYPE_PID);
-+			if (task && (task->rt_priority <= 99 && task->rt_priority >= 1) && task->rt_priority > prio_highest) {
-+				prio_highest = task->rt_priority;
++			int prio = gcaps_rt_prio_of(tsg->tgid);
++
++			if (prio >= 1 && prio <= 99 && prio > prio_highest) {
++				prio_highest = prio;
 +				*pid_next = tsg->tgid;
 +			}
 +		}	
@@ -54,8 +118,13 @@
 +		return;
 +	}
 +
-+	task = pid_task(find_vpid(*pid_next), PIDTYPE_PID);
-+	*rt_prio_next = task->rt_priority;
++	*rt_prio_next = gcaps_rt_prio_of(*pid_next);
++	if (*rt_prio_next < 0) {
++		/* winner exited between the scan and here: report "none" */
++		*pid_next = -1;
++		*rt_prio_next = 0;
++		return;
++	}
 +
 +	for (i = 0; i < f->num_channels; i++) {
 +		tsg = &f->tsg[i];
@@ -91,9 +160,9 @@
 +	struct nvgpu_sched_ctrl *sched = &g->sched_ctrl;
 +	struct nvgpu_rl_ctrl *rl_ctrl = &sched->rl_ctrl;
 +	struct nvgpu_rt_rl *rt_task_in_rl = &rl_ctrl->rt_task_in_rl;
-+	struct task_struct *task_caller;
-+	struct task_struct *task_next;
-+	int i, j;
++	/* NOT a task_struct *: this outlives the sleeping runlist reload. */
++	int caller_prio;
++	int i;
 +	int err = 0;
 +	pid_t cpid = args->pid;
 +	bool add_req = args->add_req;
@@ -119,21 +188,26 @@
 +	pid_t preempted_pid = -1;      /* rt task evicted to pending by this add */
 +	pid_t resumed_pid = -1;        /* task put back into the runlist on remove */
 +
-+	char except_proc_names[][32] = {"Xorg", "gnome-shell"};
 +
 +	*new_tsg_in_rl = 0;
 +	*tsgs_cpid = 0;
 +	*tsgs_next = 0;
 +
-+	task_caller = pid_task(find_vpid(cpid), PIDTYPE_PID);
++	caller_prio = gcaps_rt_prio_of(cpid);
 +
 +	/* sync-based approach, no need to update runlists */
 +	if (sync_mode == true) {
 +		if (add_req == true) {
 +			nvgpu_mutex_acquire(&sched->sync_fence_lock);
++			nvgpu_kfree(g, tsgs_next);
++			nvgpu_kfree(g, tsgs_cpid);
++			nvgpu_kfree(g, new_tsg_in_rl);
 +			return 0;
 +		}else {
 +			nvgpu_mutex_release(&sched->sync_fence_lock);
++			nvgpu_kfree(g, tsgs_next);
++			nvgpu_kfree(g, tsgs_cpid);
++			nvgpu_kfree(g, new_tsg_in_rl);
 +			return 0;
 +		}
 +	}
@@ -143,15 +217,8 @@
 +	/* get tsgs of the excepted proc */
 +	for (i = 0; i < f->num_channels; i++) {
 +		struct nvgpu_tsg *tsg = &f->tsg[i];
-+		struct task_struct *task = pid_task(find_vpid(tsg->tgid), PIDTYPE_PID);
-+		if (task == NULL) {
-+			continue;
-+		}
-+		for (j = 0; j < 2; j++) {
-+			if (strcmp(except_proc_names[j], task->comm) == 0) {
-+				nvgpu_set_bit(i, new_tsg_in_rl);
-+				break;
-+			}
++		if (gcaps_is_except_proc(tsg->tgid)) {
++			nvgpu_set_bit(i, new_tsg_in_rl);
 +		}
 +	}
 +
@@ -167,7 +234,7 @@
 +	}
 +
 +	if (add_req) { /* the caller task requests to be added */
-+		if (task_caller->rt_priority <= 0) { /* the caller task is not a rt task */
++		if (caller_prio <= 0) { /* not a rt task, or it has exited */
 +			/* no rt task of the same #op_type, add the caller to runlists */
 +			if (rt_task_in_rl->pid == RL_CTRL_NO_RT_PID) {
 +				// pr_info("------ be task pid %d add request granted\n", cpid);
@@ -184,7 +251,7 @@
 +		}else { /* the caller task is a rt task */
 +			/* do not allow interleaved execution if tasks are of the same rt_prio, use FIFO in this case */
 +			/* the caller's rt_prio is higher than the running one of the same #op_type, add it to the runlists, and REMOVE the current running ones (add to pending) */
-+			if (task_caller->rt_priority > rt_task_in_rl->rt_prio) {
++			if (caller_prio > rt_task_in_rl->rt_prio) {
 +				/* the running rt task (if any) is about to be evicted to
 +				 * pending by this higher-priority add: record the victim. */
 +				preempted_pid = rt_task_in_rl->pid;
@@ -194,7 +261,7 @@
 +					*rl_ctrl->tsg_running = *tsgs_cpid;
 +					*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
 +					rt_task_in_rl->pid = cpid;
-+					rt_task_in_rl->rt_prio = task_caller->rt_priority;
++					rt_task_in_rl->rt_prio = caller_prio;
 +			}else {
 +				/* the caller's rt_prio is not higher than the running one of the same #op_type, remove it from runlists */
 +				// pr_info("------ rt task pid %d add request pending\n", cpid);
@@ -227,7 +294,6 @@
 +				 * fence.  See preempted-caller-runlist-overwrite-bug.md */
 +				*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
 +			}else {
-+				task_next = pid_task(find_vpid(pid_next), PIDTYPE_PID);
 +				resumed_pid = pid_next; /* this task is resumed back into the runlist */
 +				/* Found the next rt task of #op_type: remove the CALLER and
 +				 * admit that task.  Set difference + union, never a wholesale
@@ -247,16 +313,17 @@
 +			// search tsg_running for rt tasks
 +			for (i = 0; i < f->num_channels; i++) {
 +				struct nvgpu_tsg *tsg = &f->tsg[i];
-+				struct task_struct *task = pid_task(find_vpid(tsg->tgid), PIDTYPE_PID);
++				int prio;
++
 +				if (!NVGPU_SCHED_ISSET(tsg->tsgid, sched->active_tsg_bitmap)) {
 +					continue;
 +				}
 +				if (nvgpu_test_bit(i, sched->rl_ctrl.tsg_running)) {
-+					task = pid_task(find_vpid(tsg->tgid), PIDTYPE_PID);
-+					if (task && (task->rt_priority <= 99 && task->rt_priority >= 1)) {
++					prio = gcaps_rt_prio_of(tsg->tgid);
++					if (prio >= 1 && prio <= 99) {
 +						// pr_alert("this must be reported: a pending be task is requesting to be removed, running rt task: %d.", tsg->tgid);
 +						rt_task_in_rl->pid = tsg->tgid;
-+						rt_task_in_rl->rt_prio = task->rt_priority;
++						rt_task_in_rl->rt_prio = prio;
 +						exist = true;
 +						break;
 +					}
@@ -285,6 +352,18 @@
 +			struct nvgpu_channel *ch;
 +			bool add = nvgpu_test_bit(i, new_tsg_in_rl);
 +
++			/* The other three loops in this function gate on active_tsg_bitmap;
++			 * this one did not, so it walked torn-down slots and handed a bare
++			 * channel / NULL tsg->runlist to runlist.update -> "Bare channel in
++			 * runlist update" and a NULL deref.  Reproduced as a kernel oops
++			 * under doubled channel churn (-S 0.5). */
++			if (!NVGPU_SCHED_ISSET(tsg->tsgid, sched->active_tsg_bitmap)) {
++				continue;
++			}
++			if (tsg->runlist == NULL) {
++				continue;
++			}
++
 +			nvgpu_list_for_each_entry(ch, &tsg->ch_list,
 +					nvgpu_channel, ch_entry) {
 +				err = g->ops.runlist.update(g, tsg->runlist, ch, add, true); // runlist lock is inside of it
@@ -312,10 +391,16 @@
 +	 *   resumed     - pid re-admitted to the runlist by this remove, or -1 */
 +	pr_info("GCAPS_EV ts=%lld cpid=%d prio=%d add=%d rlupd=%d elapsed_us=%lld preempted=%d resumed=%d",
 +		ktime_to_ns(stop_time), cpid,
-+		task_caller ? (int)task_caller->rt_priority : -1,
++		caller_prio,
 +		add_req ? 1 : 0, rl_updated ? 1 : 0, elapsed_time,
 +		preempted_pid, resumed_pid);
 +	rt_mutex_unlock(&sched->cs_lock);
++
++	/* The published patch never freed these on ANY path -- ~3 x bitmap_size
++	 * of kernel memory leaked per ioctl call. */
++	nvgpu_kfree(g, tsgs_next);
++	nvgpu_kfree(g, tsgs_cpid);
++	nvgpu_kfree(g, new_tsg_in_rl);
 +	return err;
 +}
 +
@@ -323,7 +408,7 @@
  {
  	struct gk20a_ctrl_priv *priv = filp->private_data;
 \ No newline at end of file
-@@ -2596,6 +2876,11 @@
+@@ -2596,6 +2961,11 @@
  		err = nvgpu_gpu_ioctl_get_buffer_info(g,
  			(struct nvgpu_gpu_get_buffer_info_args *)buf);
  		break;
