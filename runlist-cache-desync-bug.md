@@ -19,6 +19,43 @@ resource, used to suppress updates, with no invalidation), distinct from and
 deeper than the best-effort overwrite bug in
 [`best-effort-tasks-bug.md`](best-effort-tasks-bug.md).
 
+> ## CORRECTION (2026-08-28) — this is not what causes the observed hang
+>
+> The symptom recorded below (highest-priority task stuck on a GPU fence, others
+> exited, `dmesg` clean) is real and reproduces, but it is **not** caused by the
+> cache skip. It is caused by a wholesale `tsg_running` overwrite in the remove
+> path when the caller has already been preempted — see
+> [`preempted-caller-runlist-overwrite-bug.md`](preempted-caller-runlist-overwrite-bug.md).
+>
+> Decisive evidence: in the failing window **every event carries `rlupd=1`**, so
+> the runlist was rebuilt on every call and no update was ever skipped. The
+> kernel-event trace pins the exact statement that drops the running task.
+>
+> Two claims below are therefore withdrawn:
+>
+> - **"`-d 10` completes; `-d 20` hangs"** does not reproduce. Measured
+>   2026-08-28 on R35.6.4 with railgating off, `workloadTasksetGcaps` fails
+>   **identically** at `-d 10` and `-d 20`, always on the same task's 26th
+>   segment at t+2.49 s, across reboots. `main -f taskset.csv -d 30 -i 1` is
+>   clean (1650 events, 825/825 balanced). There is no duration ceiling to
+>   bisect, so the workaround advice at the end of this document rests on a
+>   false premise — shorter runs and fewer tasks do not lower the hit
+>   probability, because the trigger is a fixed periodic phasing, not a race
+>   that accumulates with segment count.
+> - **"duration / iteration-count dependent, the signature of a timing race"** —
+>   the failure is fully deterministic. The apparent intermittency came from two
+>   measurement artifacts: counting the add/remove balance over a truncated log
+>   window (which hides the stuck task by clipping its opening `add=1`), and a
+>   run timeout landing inside the benchmark's ~60 s serialised post-run
+>   verification tail (which reported three tasks as hung that were not).
+>
+> **What survives:** the design-level concern in this document is untouched. A
+> private shadow copy of a concurrently-mutated resource, used to suppress
+> updates, with no invalidation is unsound regardless — the normal nvgpu path
+> really does write `active_channels` behind GCAPS's back, and nothing
+> reconciles the two. It has simply **not been observed to fire**. Fix the
+> overwrite bug first, then re-test before spending effort here.
+
 ## Symptom
 
 On Jetson AGX Orin (L4T R35.6) running the `workloadTasksetGcaps` mixed taskset

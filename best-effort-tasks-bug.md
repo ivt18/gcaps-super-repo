@@ -14,6 +14,19 @@ It is undocumented; the authors' evaluations never exercised it because every
 configuration they actually *ran* had at most one macro-instrumented best-effort
 GPU task.
 
+> **UPDATE (2026-08-28): the same defect exists in the sibling branch, and it
+> hits real-time tasks.** Algorithm 1 line 21 (`Move τk to task_running`) is
+> implemented as `*rl_ctrl->tsg_running = *tsgs_next;` — another wholesale
+> assignment, taken when a pending real-time task exists. It drops a
+> **real-time** task that was running, whenever the removing caller had already
+> been preempted. See
+> [`preempted-caller-runlist-overwrite-bug.md`](preempted-caller-runlist-overwrite-bug.md).
+>
+> Consequence for this document: **the all-real-time workaround below is not
+> sufficient.** It avoids the branch described here, and lands squarely in the
+> other one. Both need the same treatment (set difference and union, never
+> assignment), so fix them together.
+
 ## Root cause
 
 `gcaps_driver_patch/ioctl_ctrl.c.patch`, function
@@ -70,8 +83,17 @@ Two best-effort GPU tasks `A` and `B`, both calling `gcapsGpuSegBegin/End`:
    `gcapsGpuSegEnd` (`cudaEventSynchronize`) blocks forever → **deadlock**.
 
 A *single* best-effort GPU task never triggers it (there is no second running
-task to lose). Real-time tasks are immune: at most one real-time task is in
-`task_running` at any time, so there is never a second running task to drop.
+task to lose). Real-time tasks are immune **to this branch**: at most one
+real-time task is in `task_running` at any time, so there is never a second
+running task to drop *here*.
+
+> **That immunity does not generalise.** It holds only because this branch
+> requires `task_running` to contain two entries. The sibling branch
+> (`task_pending` non-empty, Algorithm 1 line 21) overwrites `task_running`
+> outright, so dropping the *single* running real-time task is enough — and that
+> is exactly what happens when the removing caller was already preempted by it.
+> See
+> [`preempted-caller-runlist-overwrite-bug.md`](preempted-caller-runlist-overwrite-bug.md).
 
 ## Why it was never observed
 
@@ -111,9 +133,12 @@ overwriting — union rather than assign:
 (Equivalently in the pseudocode: `task_running ← task_running ∪ task_pending`
 after removing the caller.)
 
-**Userspace (workaround, used by this benchmark).** Give every GPU task a
-real-time priority (`SCHED_FIFO`, ≥ 1) so the buggy best-effort path is never
-taken. `gcaps_userspace/workloadTasksetGcaps.cc` now assigns the two formerly
+**Userspace (workaround, used by this benchmark — NOT sufficient on its own).**
+Give every GPU task a real-time priority (`SCHED_FIFO`, ≥ 1) so the buggy
+best-effort path is never taken. This closes *this* bug only: it moves every
+task onto the real-time path, where the sibling overwrite
+([`preempted-caller-runlist-overwrite-bug.md`](preempted-caller-runlist-overwrite-bug.md))
+deadlocks `workloadTasksetGcaps` after ~2.5 s. Only the driver fix closes both. `gcaps_userspace/workloadTasksetGcaps.cc` now assigns the two formerly
 best-effort tasks (`mm_2048`, `hist_4M`) the two **lowest** real-time priorities
 instead of `SCHED_OTHER`. This also makes the benchmark a more direct comparison
 with the SequenceScheduler benchmark in `msc-thesis-on-gpu-sched`, which
