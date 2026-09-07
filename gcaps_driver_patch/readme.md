@@ -66,6 +66,27 @@ This folder includes the implementation of GCAPS approach in Tegra driver.
     tar xf gcc-linaro-7.3.1-2018.05-x86_64_aarch64-linux-gnu.tar.xz
     ```
 
+## Build it with one command (R35 Orin)
+
+`build_gcaps_r35.sh` does everything below — applies the four patches
+idempotently, builds `nvgpu.ko` natively on the Orin, verifies vermagic and
+unresolved symbols, stages the variant and installs it:
+
+```bash
+./gcaps_driver_patch/build_gcaps_r35.sh --check   # preflight only
+sudo ./gcaps_driver_patch/build_gcaps_r35.sh      # patch + build + verify + install
+```
+
+It guards the three build traps that the manual route keeps re-discovering
+(`srctree.nvgpu` pointing at the headers-only copy, a missing `srctree.nvidia`,
+and the `Argument list too long` link failure from a long build path), and it
+never live-swaps the module — the board is shared, so it tells you to reboot.
+Source trees default to `$KG=~/kg` (nvgpu) and `$KN=~/kn` (nvidia); override via
+the environment.
+
+The manual steps below remain the reference for the cross-compile route and for
+understanding what the script does.
+
 ## Apply the Patches
 1. Direct to `nvgpu` driver path
     ```bash
