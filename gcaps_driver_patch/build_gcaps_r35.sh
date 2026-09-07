@@ -12,7 +12,9 @@
 #   ./build_gcaps_r35.sh --check          # preflight only, changes nothing
 #   ./build_gcaps_r35.sh                  # patch, build, verify, stage, install
 #   ./build_gcaps_r35.sh --no-install     # stop after staging
-#   ./build_gcaps_r35.sh --repatch-from 50cbdb4   # tree is at an OLDER revision
+#   ./build_gcaps_r35.sh --probe-revisions        # which revision IS the tree at?
+#   ./build_gcaps_r35.sh --repatch-from 15f5911   # tree is at an OLDER revision
+#   ./build_gcaps_r35.sh --from-pristine ~/kv     # tree was hand-edited; reset it
 #
 # DO NOT run this under sudo.  It refuses to start as root, for two reasons:
 # sudo rewrites HOME, so $KG/$KN would default to /root/kg and /root/kn; and
@@ -21,6 +23,15 @@
 # sudo itself for the two steps that need it (staging into /lib/modules and
 # depmod), and validates the credential up front so a password prompt cannot
 # interrupt the build.
+#
+# --from-pristine DIR is the case --repatch-from cannot handle: a tree that was
+# hand-edited rather than produced by applying a committed patch.  That is how
+# the R35 fixes were originally made, so $KG's comment prose differs from what
+# any revision of these patches generates and NO revision reverses cleanly.
+# --from-pristine takes the four files from an unpatched nvgpu tree (validating
+# that the current patch set applies to each before touching anything), copies
+# them in, and patches normally.  --probe-revisions answers which of the two
+# situations you are in, read-only.
 #
 # --repatch-from REV is the normal case on a board that has built GCAPS before:
 # $KG is already patched, but at the PREVIOUS revision of these patch files, so
@@ -76,6 +87,8 @@ MAX_M_PATH_LEN="${MAX_M_PATH_LEN:-48}"
 CHECK_ONLY=0
 DO_INSTALL=1
 REPATCH_FROM=""
+FROM_PRISTINE=""
+PROBE=0
 while (( $# )); do
     case "$1" in
         --check)           CHECK_ONLY=1 ;;
@@ -86,6 +99,10 @@ while (( $# )); do
         --repatch-from)    [[ $# -ge 2 ]] || { echo "--repatch-from needs a revision" >&2; exit 1; }
                            REPATCH_FROM="$2"; shift ;;
         --repatch-from=*)  REPATCH_FROM="${1#*=}" ;;
+        --from-pristine)   [[ $# -ge 2 ]] || { echo "--from-pristine needs a directory" >&2; exit 1; }
+                           FROM_PRISTINE="$2"; shift ;;
+        --from-pristine=*) FROM_PRISTINE="${1#*=}" ;;
+        --probe-revisions) PROBE=1; CHECK_ONLY=1 ;;
         -j*)               JOBS="${1#-j}" ;;
         -h|--help)         sed -n '2,50p' "$0"; exit 0 ;;
         *)                 echo "unknown argument: $1" >&2; exit 1 ;;
@@ -226,8 +243,9 @@ migrate_patch() {
     cp -p "$tgt" "$tmp"
     patch -s -R -p0 -f "$tmp" < "$oldpf" >/dev/null 2>&1 \
         || fail "$rel is not at revision '$REPATCH_FROM' either — cannot reverse it.
-      Find the revision the tree WAS patched at, or restore $rel from a
-      pristine source tree and re-run without --repatch-from."
+      Run '$0 --probe-revisions' to see whether ANY revision matches.  If none
+      does, the tree was hand-edited and no patch will reverse out of it; reset
+      it with '$0 --from-pristine <unpatched-nvgpu-tree>'."
 
     # $tmp is pristine at exactly this point -- the only moment a genuine
     # unpatched copy exists, so keep one for future runs to classify against.
@@ -250,10 +268,11 @@ apply_patch() {
         PRISTINE) ;;
         UNKNOWN)
             [[ -n "$REPATCH_FROM" ]] || fail "cannot apply $pf to $rel — the tree is neither pristine nor patched.
-      If this board has built GCAPS before, the tree is patched at an OLDER
-      revision of these files: re-run with --repatch-from <git-rev>, naming the
-      revision it was last patched at.  Otherwise restore $rel from a pristine
-      source tree."
+      Find out which situation you are in, read-only:
+          $0 --probe-revisions
+      A full 'ok' row means the tree is at that revision — use --repatch-from.
+      No match means it was hand-edited and no patch will reverse out of it —
+      use --from-pristine <unpatched-nvgpu-tree>."
             migrate_patch "$rel" "$pf"
             return ;;
     esac
@@ -263,6 +282,71 @@ apply_patch() {
         || fail "patch passed its dry-run but failed for real: $rel"
     ok "patched: $rel  (original kept as $(basename "$tgt").gcaps-orig)"
 }
+
+# Read-only: for every revision that ever touched these patch files, can that
+# revision's patch be reversed out of the tree?  A row of all-ok names the
+# revision to pass to --repatch-from.  No row matching means the tree was not
+# produced by any committed patch -- it was hand-edited -- and --from-pristine
+# is the way out.
+if (( PROBE )); then
+    step "probing revisions"
+    printf '  %-9s %-13s %-8s %-8s %-13s\n' \
+           "rev" "ioctl_ctrl.c" "sched.c" "sched.h" "nvgpu-ctrl.h"
+    any=0
+    for rev in $(git -C "$SELF_DIR" log --format=%h --all -- \
+                     gcaps_driver_patch/ioctl_ctrl.c.patch \
+                     gcaps_driver_patch/sched.c.patch \
+                     gcaps_driver_patch/sched.h.patch 2>/dev/null); do
+        cells=(); allok=1
+        for entry in "${PATCH_TARGETS[@]}"; do
+            rel="${entry%%:*}"; pf="${entry##*:}"
+            if git -C "$SELF_DIR" show "$rev:gcaps_driver_patch/$pf" > "$WORK/p" 2>/dev/null \
+               && patch -R -p0 -f --dry-run "$KG/$rel" < "$WORK/p" >/dev/null 2>&1; then
+                cells+=("ok")
+            else
+                cells+=("--"); allok=0
+            fi
+        done
+        suffix=""
+        (( allok )) && { suffix="  <== --repatch-from $rev"; any=1; }
+        printf '  %-9s %-13s %-8s %-8s %-13s%s\n' "$rev" \
+               "${cells[0]}" "${cells[1]}" "${cells[2]}" "${cells[3]}" "$suffix"
+    done
+    echo
+    if (( any )); then
+        echo "  A full 'ok' row names the revision the tree is at."
+    else
+        echo "  No revision reverses cleanly out of every file, so this tree was not"
+        echo "  produced by applying a committed patch — it was hand-edited.  Reset the"
+        echo "  four files from an unpatched nvgpu tree instead:"
+        echo "      $0 --from-pristine <path-to-pristine-nvgpu-tree>"
+    fi
+    echo; echo "== --probe-revisions: nothing was modified =="
+    exit 0
+fi
+
+# Reset the patch targets from an unpatched tree.  EVERY file is validated
+# before ANY is copied, so a bad --from-pristine leaves $KG untouched.
+if [[ -n "$FROM_PRISTINE" ]]; then
+    step "restoring from pristine tree $FROM_PRISTINE"
+    [[ -d "$FROM_PRISTINE" ]] || fail "not a directory: $FROM_PRISTINE"
+    for entry in "${PATCH_TARGETS[@]}"; do
+        rel="${entry%%:*}"; pf="${entry##*:}"
+        [[ -f "$FROM_PRISTINE/$rel" ]] \
+            || fail "pristine tree has no $rel
+      Expected $FROM_PRISTINE/$rel — is that the root of an nvgpu source tree?"
+        patch -p0 -f --dry-run "$FROM_PRISTINE/$rel" < "$SELF_DIR/$pf" >/dev/null 2>&1 \
+            || fail "$FROM_PRISTINE/$rel is not pristine — the current patch does not
+      apply to it, so that tree is already patched or is the wrong version."
+    done
+    ok "all 4 files validated as pristine"
+    for entry in "${PATCH_TARGETS[@]}"; do
+        rel="${entry%%:*}"
+        cp -p "$KG/$rel" "$KG/$rel.gcaps-prev"
+        cp -p "$FROM_PRISTINE/$rel" "$KG/$rel"
+        ok "reset: $rel  (previous kept as $(basename "$rel").gcaps-prev)"
+    done
+fi
 
 if (( CHECK_ONLY )); then
     n_unknown=0
