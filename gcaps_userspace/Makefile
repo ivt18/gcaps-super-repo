@@ -93,7 +93,7 @@ $(APP_BUILD_DIR)/projection.o: $(APP_DIR)/projection/projection.cu
 $(APP_BUILD_DIR)/seqworkload.o: $(APP_DIR)/seqworkload/seqworkload.cu
 	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
-all: main tsg_ctxsw workloadSweepGcaps workloadTasksetGcaps preemptOverheadGcaps
+all: main tsg_ctxsw workloadSweepGcaps workloadTasksetGcaps preemptOverheadGcaps cpuWakeupLatencyGcaps
 # Build
 BUILD_DIR = build
 $(shell mkdir -p $(BUILD_DIR))
@@ -125,6 +125,15 @@ preemptOverheadGcaps: $(BUILD_DIR)/preemptOverheadGcaps.o $(APP_BUILD_DIR)/seqwo
 $(BUILD_DIR)/preemptOverheadGcaps.o: preemptOverheadGcaps.cc
 	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
+# EQ 2.2 GCAPS arm.  Self-contained (its own busy-wait+stamp kernel, no
+# seqworkload), and a .cu rather than the usual .cc because it defines that
+# kernel and includes common/include/clock_calib.cuh, which defines another --
+# nvcc only treats .cu as device code.
+cpuWakeupLatencyGcaps: $(BUILD_DIR)/cpuWakeupLatencyGcaps.o
+	$(NVCC) $(INCLUDES) $(LDFLAGS) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
+$(BUILD_DIR)/cpuWakeupLatencyGcaps.o: cpuWakeupLatencyGcaps.cu
+	$(NVCC) $(INCLUDES) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+
 .PHONY: clean
 clean:
-	rm -rf $(APP_BUILD_DIR) $(BUILD_DIR) build main tsg_ctxsw workloadSweepGcaps workloadTasksetGcaps preemptOverheadGcaps
+	rm -rf $(APP_BUILD_DIR) $(BUILD_DIR) build main tsg_ctxsw workloadSweepGcaps workloadTasksetGcaps preemptOverheadGcaps cpuWakeupLatencyGcaps

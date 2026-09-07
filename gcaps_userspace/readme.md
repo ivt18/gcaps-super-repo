@@ -329,6 +329,61 @@ owns the record format, the `elapsed_ns`/`elapsed_us` preference and the
 reset/drain helpers — so there is one parser to change if the record grows a
 field.
 
+## CPU Wakeup Latency (EQ 2.2)
+
+`cpuWakeupLatencyGcaps` is the GCAPS arm of the thesis's EQ 2.2 comparison —
+how long after the GPU segment finishes the waiting CPU thread is unblocked.
+It is the counterpart of singleTaskSched's `cpuWakeupLatencyBenchSeq`
+(SequenceScheduler) and `cpuWakeupLatencyStreamBaseline` (plain stream), and
+deliberately shares their W_i definition, release grid and clock calibration:
+
+```
+W_i = (wakeup_ns + cpu_to_gpu_offset_ns) - completion_ns
+```
+
+- `completion_ns` — `%globaltimer` stamped by the segment kernel's own last
+  instruction. Same kernel, same stamp point, all three arms.
+- `wakeup_ns` — `CLOCK_MONOTONIC` the instant the segment-end wait returns,
+  **before** the remove ioctl. The thread is running again at that point; the
+  ioctl after it is runlist bookkeeping, and folding it into W_i would compare
+  seq's wake path against GCAPS's wake path *plus* a runlist reload. It is
+  reported separately as `seg_end_ioctl_ns`.
+- The clock conversion uses a **vendored copy** of the thesis repo's
+  `clock_calib.cuh` (`common/include/`) — same estimator, same two-point drift
+  interpolation — so a W_i difference between arms cannot be the calibration.
+
+The wait primitive is GCAPS's own: `cudaEventSynchronize` on the segment's
+`stop` event, with `cudaEventBlockingSync` inside a
+`cudaDeviceScheduleBlockingSync` context (what `gcapsGpuSegEnd` plus
+SeqWorkload's `-b 1` suspend mode do). The stream baseline instead blocks in
+`cudaStreamSynchronize`; `--wait stream` switches this binary over so that
+difference can be separated from the ioctl path.
+
+```bash
+make cpuWakeupLatencyGcaps
+
+# GCAPS, 50 us segments, 500 jobs (needs the patched driver; sudo for RT)
+sudo ./cpuWakeupLatencyGcaps 50 500 -i 1 --realtime > gcaps_w.csv
+
+# TSG baseline through the same code path (no driver needed)
+./cpuWakeupLatencyGcaps 50 500 -i 0 > tsg_w.csv
+```
+
+`--realtime` is effectively mandatory for `-i 1`: GCAPS classifies the caller by
+its `rt_priority`, so without SCHED_FIFO every ioctl takes the best-effort path.
+RT is applied **after** the CUDA context exists, so the driver's internal
+threads are not spawned by an RT thread and do not inherit SCHED_FIFO — the rule
+`cpuWakeupLatencyBenchSeq` follows. `--rt-early` reproduces the opposite
+ordering (which is what `cpuWakeupLatencyStreamBaseline` currently does).
+
+Drive all three arms together from the thesis repo:
+
+```bash
+sudo python3 scripts/cpu_efficiency/run_cpu_wakeup_latency.py --realtime \
+    --gcaps-binary <gcaps-super-repo>/gcaps_userspace/cpuWakeupLatencyGcaps
+python3 scripts/cpu_efficiency/analyze_cpu_wakeup_latency.py
+```
+
 ## References
 [1] Yidi Wang, Cong Liu, Daniel Wong, and Hyoseung Kim. GCAPS: GPU Context-Aware Preemptive Priority-based Scheduling for Real-Time Tasks. In Euromicro Conference on Real-Time Systems (ECRTS), 2024.
 [2] Björn B Brandenburg. The FMLP+: An asymptotically optimal real-time locking protocol for suspension-aware analysis. In 2014 26th Euromicro Conference on Real-Time Systems, pages 61–71. IEEE, 2014.

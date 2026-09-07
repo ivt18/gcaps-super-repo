@@ -1,0 +1,538 @@
+/**
+ * ============================================================================
+ * cpuWakeupLatencyGcaps.cu  — EQ 2.2, GCAPS arm
+ * ============================================================================
+ *
+ * GCAPS counterpart to singleTaskSched's cpuWakeupLatencyBenchSeq (Sequence-
+ * Scheduler) and cpuWakeupLatencyStreamBaseline (plain stream).  Measures how
+ * long after the GPU segment finishes the waiting CPU thread is unblocked.
+ *
+ *   W_i = (wakeup_cpu_ns + cpu_to_gpu_offset_ns) − completion_gpu_ns
+ *
+ *   completion_gpu_ns — %globaltimer written by the SEGMENT KERNEL's own last
+ *                       instruction into a pinned slot.  Identical kernel and
+ *                       identical stamp point to both sibling binaries.
+ *   wakeup_cpu_ns     — CLOCK_MONOTONIC captured immediately after the GCAPS
+ *                       segment-end wait returns, BEFORE the remove ioctl.
+ *
+ * WHY BEFORE THE REMOVE IOCTL.  This is the counterpart of the seq binary's
+ * "not ReleaseStatistics::completionTime" decision.  `gcapsGpuSegEnd` is
+ *
+ *     cudaEventRecord(stop, stream); cudaEventSynchronize(stop); ioctl(remove);
+ *
+ * The thread is *running again* the moment cudaEventSynchronize returns; the
+ * remove ioctl that follows is GCAPS's runlist bookkeeping, not part of the
+ * wake path.  Folding it into W_i would compare seq's wake path against
+ * GCAPS's wake path *plus* a runlist reload, and the reload is already
+ * measured properly elsewhere (the driver's own GCAPS_EV elapsed_us, and
+ * scripts/measure_preempt_overhead.py).  It is reported here as a separate
+ * column instead, mirroring how seq splits W into detect_ns + notify_ns:
+ *
+ *   W_ns                = wakeup − T_seg        (comparable across all arms)
+ *   seg_end_ioctl_ns    = the remove ioctl      (GCAPS ε, wall, host-side)
+ *   seg_begin_ioctl_ns  = the add ioctl         (paid before the kernel runs)
+ *
+ * THE WAIT PRIMITIVE is GCAPS's own — cudaEventSynchronize on the segment's
+ * `stop` event, created with cudaEventBlockingSync, inside a context created
+ * with cudaDeviceScheduleBlockingSync.  That is what `gcapsGpuSegEnd` plus
+ * SeqWorkload's suspend mode (-b 1) do, so W_i is GCAPS's real wake path and
+ * not an approximation of it.  The stream baseline instead blocks in
+ * cudaStreamSynchronize.  `--wait stream` switches this binary to
+ * cudaStreamSynchronize so that difference can be isolated: if the GCAPS and
+ * Stream arms disagree, `--wait stream` says how much of the gap is the ioctl
+ * path and how much is merely event-vs-stream sync.
+ *
+ * RELEASE CADENCE — jobs are released on an ABSOLUTE grid (t0 + i*period,
+ * default 997 µs), matching both sibling binaries.  GCAPS has no monitor to
+ * de-phase, so the co-primality argument in the seq header does not apply
+ * here; the grid is kept anyway because EQ 2.2 is a head-to-head and an
+ * unequal release rate or GPU duty cycle would leave a W_i difference
+ * attributable to something other than the wake path.
+ *
+ * REAL-TIME.  `--realtime` is effectively MANDATORY for -i 1: the driver reads
+ * the caller's rt_priority to decide whether it is a real-time task at all, so
+ * without SCHED_FIFO the ioctl runs the best-effort path and measures nothing.
+ *
+ * RT is applied AFTER the CUDA runtime has been initialised, which is the rule
+ * cpuWakeupLatencyBenchSeq states ("applied AFTER start() so CUDA's internal
+ * threads do not inherit RT") — pthread_create defaults to
+ * PTHREAD_INHERIT_SCHED, so a driver thread spawned by an RT thread would come
+ * up SCHED_FIFO too.  MEASURED (CUDA 13.3, desktop driver): all four driver
+ * worker threads appear at the FIRST cuda* runtime call and none afterwards,
+ * including across hundreds of launch/event-sync cycles — so on that stack the
+ * ordering is moot and cpuWakeupLatencyStreamBaseline, which switches to
+ * SCHED_FIFO after its own first runtime call (cudaSetDeviceFlags), is equally
+ * safe.  The ordering is kept because it costs nothing and makes the property
+ * hold by construction rather than by driver version; re-check with
+ * /proc/self/task if the CUDA version changes.  `--rt-early` moves the switch
+ * ahead of the first runtime call, which is the one ordering that WOULD leak
+ * RT into the driver's threads — for testing that, nothing else.
+ *
+ * Output columns are a superset of cpuWakeupLatencyStreamBaseline's shared set
+ * (job_id,completion_ns,wakeup_ns,W_ns) so run_cpu_wakeup_latency.py can drive
+ * this binary as a third arm.
+ *
+ * Usage: cpuWakeupLatencyGcaps [EXEC_US [N_JOBS]] [options]
+ *   EXEC_US               Segment execution time in µs.        (default: 50)
+ *   N_JOBS                Number of sequential job repetitions.(default: 500)
+ *   -i 0|1                GCAPS ioctl elevation off/on.        (default: 1)
+ *   --realtime            SCHED_FIFO 50 on the measuring thread; needed for -i 1.
+ *   --warmup N            Throwaway releases before job 0.     (default: 10)
+ *   --release-period-us N Absolute release grid period.        (default: 997)
+ *   --wait event|stream   Wait primitive.                      (default: event)
+ *   --cpu N               Pin the measuring thread to CPU N.   (default: 2)
+ *   --no-pin              Do not pin.
+ *   --rt-early            Apply SCHED_FIFO before the first CUDA call.
+ *   --spin                Do NOT use blocking sync (GCAPS's default -b 0 mode).
+ */
+
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <vector>
+
+#include <cuda_runtime.h>
+#include <linux/nvgpu.h>
+
+#include "common/include/clock_calib.cuh"
+
+/* Same band as the sibling binaries: the measuring thread runs at 50. */
+static constexpr int RT_PRIORITY = 50;
+/* cpuWakeupLatencyBenchSeq's RELEASE_CPU — the thread whose wake-up is timed. */
+static constexpr int DEFAULT_PIN_CPU = 2;
+
+/* Release cadence — MUST MATCH the sibling binaries. */
+static constexpr uint64_t DEFAULT_RELEASE_PERIOD_US = 997;
+/* Non-exec part of a job cycle (launch + both ioctls + wake) — used only to
+ * warn when the requested period is too short for the grid to hold. */
+static constexpr uint64_t RELEASE_CYCLE_SLACK_US    = 40;
+/* t0 is stamped this far in the FUTURE so job 0 actually sleeps to its grid
+ * point instead of finding its deadline already past. */
+static constexpr uint64_t STARTUP_MARGIN_NS         = 10000000ULL;   // 10 ms
+
+static const char* GCAPS_CTRL_DEV = "/dev/nvgpu/igpu0/ctrl";
+
+// ============================================================================
+// Clocks
+// ============================================================================
+
+static inline uint64_t host_ns()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Sleep to an ABSOLUTE CLOCK_MONOTONIC deadline; EINTR retries the unchanged
+ * deadline so the grid resumes rather than extends. */
+static void sleep_until_ns(uint64_t target_ns)
+{
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(target_ns / 1000000000ULL);
+    ts.tv_nsec = (long)(target_ns % 1000000000ULL);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) != 0) {}
+}
+
+// ============================================================================
+// Segment kernel — byte-for-byte the sibling binaries' busy-wait + stamp, so
+// the completion instant means the same thing in all three arms.
+// ============================================================================
+
+static __device__ __forceinline__ uint64_t wgc_gpu_ns()
+{
+    uint64_t t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    return t;
+}
+
+__global__ void wgcBusyWaitStamp(const uint64_t* durationNs,
+                                 uint64_t*       completionOut)
+{
+    if (threadIdx.x != 0) return;
+    const uint64_t dur = *durationNs;
+    const uint64_t t0  = wgc_gpu_ns();
+    while (wgc_gpu_ns() - t0 < dur) { /* spin */ }
+    *completionOut = wgc_gpu_ns();
+}
+
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                       \
+        cudaError_t _e = (call);                                               \
+        if (_e != cudaSuccess) {                                               \
+            fprintf(stderr, "CUDA error at %s:%d — %s\n",                     \
+                    __FILE__, __LINE__, cudaGetErrorString(_e));               \
+            return EXIT_FAILURE;                                               \
+        }                                                                      \
+    } while (0)
+
+// ============================================================================
+// GCAPS runlist-priority ioctl — the same call sequence as support.h's
+// gcapsGpuSegBegin / gcapsGpuSegEnd, open-coded so the remove ioctl can be
+// timed separately from the wait that precedes it.
+// ============================================================================
+
+static int gcaps_runlist(int fd, pid_t pid, bool add_req, bool sync_mode)
+{
+    struct nvgpu_gpu_runlist_update_rt_prio_args args;
+    memset(&args, 0, sizeof(args));
+    args.pid       = pid;
+    args.add_req   = add_req;
+    args.sync_mode = sync_mode;
+    return ioctl(fd, NVGPU_GPU_IOCTL_RUNLIST_UPDATE_RT_PRIO, &args);
+}
+
+static void apply_rt(int pin_cpu)
+{
+    struct sched_param sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.sched_priority = RT_PRIORITY;
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
+        fprintf(stderr,
+                "WARNING: SCHED_FIFO %d failed (errno=%d) — continuing with the "
+                "default policy.  With -i 1 this INVALIDATES the run: the "
+                "driver reads rt_priority to decide whether the caller is a "
+                "real-time task at all.\n", RT_PRIORITY, errno);
+    else
+        fprintf(stderr, "  measuring thread set to SCHED_FIFO %d\n", RT_PRIORITY);
+
+    if (pin_cpu >= 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(pin_cpu, &set);
+        if (sched_setaffinity(0, sizeof(set), &set) != 0)
+            fprintf(stderr, "WARNING: pin to CPU %d failed (errno=%d)\n",
+                    pin_cpu, errno);
+        else
+            fprintf(stderr, "  measuring thread pinned to CPU %d\n", pin_cpu);
+    }
+}
+
+// ============================================================================
+// main
+// ============================================================================
+
+int main(int argc, char** argv)
+{
+    uint64_t execUs          = 50;
+    int      nJobs           = 500;
+    int      warmup          = 10;
+    int      ioctlEnabled    = 1;
+    bool     realtime        = false;
+    bool     rtEarly         = false;
+    bool     blockingSync    = true;
+    bool     waitOnEvent     = true;
+    int      pinCpu          = DEFAULT_PIN_CPU;
+    uint64_t releasePeriodUs = DEFAULT_RELEASE_PERIOD_US;
+
+    /* Positional args are collected separately so that, unlike
+     * cpuWakeupLatencyStreamBaseline, option order does not matter. */
+    std::vector<const char*> pos;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--realtime") == 0)            realtime = true;
+        else if (strcmp(argv[i], "--rt-early") == 0)       rtEarly = true;
+        else if (strcmp(argv[i], "--spin") == 0)           blockingSync = false;
+        else if (strcmp(argv[i], "--no-pin") == 0)         pinCpu = -1;
+        else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc)
+            ioctlEnabled = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc)
+            warmup = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--cpu") == 0 && i + 1 < argc)
+            pinCpu = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--release-period-us") == 0 && i + 1 < argc)
+            releasePeriodUs = (uint64_t)atoll(argv[++i]);
+        else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc) {
+            const char* w = argv[++i];
+            if      (strcmp(w, "event")  == 0) waitOnEvent = true;
+            else if (strcmp(w, "stream") == 0) waitOnEvent = false;
+            else { fprintf(stderr, "--wait expects 'event' or 'stream'\n");
+                   return EXIT_FAILURE; }
+        }
+        else pos.push_back(argv[i]);
+    }
+    if (pos.size() >= 1) execUs = (uint64_t)atoll(pos[0]);
+    if (pos.size() >= 2) nJobs  = atoi(pos[1]);
+
+    if (nJobs < 1) { fprintf(stderr, "N_JOBS must be >= 1\n"); return EXIT_FAILURE; }
+    if (warmup < 0) warmup = 0;
+    if (releasePeriodUs < 1) {
+        fprintf(stderr, "--release-period-us must be >= 1\n");
+        return EXIT_FAILURE;
+    }
+    /* OVERLAP.  One segment in flight at a time: the next grid point must not
+     * be due before the current job's remove ioctl has returned, or the grid
+     * degenerates to back-to-back releases (every sleep expires in the past)
+     * and W_i is measured at one fixed phase of whatever periodic activity the
+     * driver has, instead of over a uniform sweep of it. */
+    if (releasePeriodUs <= execUs + RELEASE_CYCLE_SLACK_US)
+        fprintf(stderr,
+                "WARNING: release period %llu us is not comfortably above the "
+                "job cycle (exec %llu us + ~%llu us of launch/ioctl/wake) — the "
+                "grid degenerates to back-to-back releases.\n",
+                (unsigned long long)releasePeriodUs,
+                (unsigned long long)execUs,
+                (unsigned long long)RELEASE_CYCLE_SLACK_US);
+
+    if (ioctlEnabled && !realtime)
+        fprintf(stderr,
+                "WARNING: -i 1 without --realtime.  GCAPS classifies the caller "
+                "by rt_priority, so every ioctl will take the best-effort path "
+                "and W_i will not describe GCAPS's real-time wake path.\n");
+
+    // ---- Blocking sync MUST be requested before the context exists ---------
+    // Runtime-API equivalent of the driver-API CU_CTX_SCHED_BLOCKING_SYNC that
+    // SeqWorkload::taskInit() uses in suspend mode (-b 1), and the same call
+    // cpuWakeupLatencyStreamBaseline makes.  Without it the wait spin-polls and
+    // W_i measures a spin loop rather than an OS wake-up.
+    if (blockingSync)
+        CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+
+    fprintf(stderr, "=== CPU Wakeup Latency (GCAPS) ===\n");
+    fprintf(stderr, "  device       : %s\n",   prop.name);
+    fprintf(stderr, "  exec_us      : %llu\n", (unsigned long long)execUs);
+    fprintf(stderr, "  n_jobs       : %d\n",   nJobs);
+    fprintf(stderr, "  warmup       : %d\n",   warmup);
+    fprintf(stderr, "  ioctl        : %s\n",   ioctlEnabled ? "on (GCAPS)"
+                                                            : "off (TSG baseline)");
+    fprintf(stderr, "  realtime     : %s%s\n", realtime ? "yes" : "no",
+            rtEarly ? " (applied before context creation)" : "");
+    fprintf(stderr, "  wait         : %s\n",   waitOnEvent ? "cudaEventSynchronize"
+                                                           : "cudaStreamSynchronize");
+    fprintf(stderr, "  blocking sync: %s\n",   blockingSync ? "yes" : "no (spin)");
+    fflush(stderr);
+
+    // ---- GCAPS control device ---------------------------------------------
+    int fd = -1;
+    if (ioctlEnabled) {
+        fd = open(GCAPS_CTRL_DEV, O_RDWR);
+        if (fd < 0) {
+            fprintf(stderr, "open %s failed (errno=%d) — is the patched nvgpu "
+                            "loaded, and are you root?\n", GCAPS_CTRL_DEV, errno);
+            return EXIT_FAILURE;
+        }
+    }
+
+    /* --rt-early: switch to SCHED_FIFO BEFORE any cuda* call, i.e. before the
+     * driver spawns its worker threads.  That is the ordering under which they
+     * would inherit RT (PTHREAD_INHERIT_SCHED).  Testing aid; see the header. */
+    if (realtime && rtEarly) apply_rt(pinCpu);
+
+    // ---- Device-side duration and per-job completion slots -----------------
+    const uint64_t durNs = execUs * 1000ULL;
+    uint64_t* d_dur = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_dur, sizeof(uint64_t)));            // creates the context
+    CUDA_CHECK(cudaMemcpy(d_dur, &durNs, sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+    uint64_t* h_completion = nullptr;
+    CUDA_CHECK(cudaMallocHost((void**)&h_completion,
+                              (size_t)nJobs * sizeof(uint64_t)));
+    /* cudaMallocHost does NOT zero: the "did this job complete" test below is
+     * `slot != 0`, so the whole buffer must start at 0 or an aborted run emits
+     * rows built from uninitialised memory. */
+    memset(h_completion, 0, (size_t)nJobs * sizeof(uint64_t));
+
+    uint64_t* h_gpuTs = nullptr;
+    CUDA_CHECK(cudaMallocHost((void**)&h_gpuTs, sizeof(uint64_t)));
+
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    /* The segment bracket's events, with GCAPS's own flags: blocking sync so
+     * cudaEventSynchronize sleeps, timing disabled otherwise (the native GCAPS
+     * apps' convention — W_i never uses cudaEventElapsedTime). */
+    unsigned evFlags = blockingSync ? cudaEventBlockingSync
+                                    : cudaEventDisableTiming;
+    cudaEvent_t evStart = nullptr, evStop = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&evStart, evFlags));
+    CUDA_CHECK(cudaEventCreateWithFlags(&evStop,  evFlags));
+
+    /* Default: RT after the runtime is up, so the driver's worker threads were
+     * created at default priority.  Matches the seq arm's rule. */
+    if (realtime && !rtEarly) apply_rt(pinCpu);
+
+    const pid_t myPid = getpid();
+
+    // ---- Start-of-run clock bracket (GPU idle) -----------------------------
+    ClockBracket clk;
+    if (clock_bracket_begin(&clk, stream, h_gpuTs) != 0) {
+        fprintf(stderr, "start calibration failed\n");
+        return EXIT_FAILURE;
+    }
+    fprintf(stderr, "  cpu_to_gpu_offset: %lld ns\n", (long long)clk.offset_start);
+    fflush(stderr);
+
+    // ---- Warm-up: absorb first-dispatch cold start; results discarded ------
+    // The seq arm does this and the stream baseline does not; matching seq
+    // keeps job 0 from being a cold-start outlier in this arm's tail stats.
+    uint64_t* h_warm = nullptr;
+    CUDA_CHECK(cudaMallocHost((void**)&h_warm, sizeof(uint64_t)));
+    for (int i = 0; i < warmup; ++i) {
+        *h_warm = 0;
+        if (ioctlEnabled && gcaps_runlist(fd, myPid, true, false) < 0)
+            fprintf(stderr, "WARNING: warm-up add ioctl failed (errno=%d)\n", errno);
+        wgcBusyWaitStamp<<<1, 1, 0, stream>>>(d_dur, h_warm);
+        cudaEventRecord(evStop, stream);
+        if (waitOnEvent) cudaEventSynchronize(evStop);
+        else             cudaStreamSynchronize(stream);
+        if (ioctlEnabled && gcaps_runlist(fd, myPid, false, false) < 0)
+            fprintf(stderr, "WARNING: warm-up remove ioctl failed (errno=%d)\n", errno);
+    }
+    cudaFreeHost(h_warm);
+
+    fprintf(stderr, "  Releasing %d jobs sequentially...\n", nJobs);
+    fflush(stderr);
+
+    // ---- Measurement loop --------------------------------------------------
+    std::vector<uint64_t> wakeupTimes((size_t)nJobs, 0);
+    std::vector<uint64_t> addIoctlNs((size_t)nJobs, 0);
+    std::vector<uint64_t> remIoctlNs((size_t)nJobs, 0);
+    bool anyFail = false;
+    int  completed = 0;
+
+    const uint64_t t0_ns      = host_ns() + STARTUP_MARGIN_NS;
+    const uint64_t relPeriodNs = releasePeriodUs * 1000ULL;
+    int late = 0;
+
+    for (int i = 0; i < nJobs; ++i) {
+        const uint64_t nominal = t0_ns + (uint64_t)i * relPeriodNs;
+        if (host_ns() > nominal) ++late;
+        sleep_until_ns(nominal);
+
+        /* --- gcapsGpuSegBegin: event record, then the add ioctl ------------ */
+        cudaEventRecord(evStart, stream);
+        if (ioctlEnabled) {
+            const uint64_t a0 = host_ns();
+            if (gcaps_runlist(fd, myPid, true, false) < 0) {
+                fprintf(stderr, "add ioctl failed (job %d, errno=%d)\n", i, errno);
+                anyFail = true;
+                break;
+            }
+            addIoctlNs[(size_t)i] = host_ns() - a0;
+        }
+
+        wgcBusyWaitStamp<<<1, 1, 0, stream>>>(d_dur, &h_completion[(size_t)i]);
+
+        /* --- gcapsGpuSegEnd: event record, THE WAIT, then the remove ioctl -- */
+        cudaEventRecord(evStop, stream);
+        const cudaError_t syncErr = waitOnEvent ? cudaEventSynchronize(evStop)
+                                                : cudaStreamSynchronize(stream);
+        wakeupTimes[(size_t)i] = host_ns();
+
+        if (syncErr != cudaSuccess) {
+            fprintf(stderr, "segment wait failed (job %d): %s\n",
+                    i, cudaGetErrorString(syncErr));
+            anyFail = true;
+            break;
+        }
+
+        if (ioctlEnabled) {
+            const uint64_t r0 = host_ns();
+            if (gcaps_runlist(fd, myPid, false, false) < 0) {
+                fprintf(stderr, "remove ioctl failed (job %d, errno=%d)\n", i, errno);
+                anyFail = true;
+                break;
+            }
+            remIoctlNs[(size_t)i] = host_ns() - r0;
+        }
+        completed = i + 1;
+    }
+
+    fprintf(stderr, "  Done.\n");
+    fflush(stderr);
+
+    // ---- End-of-run clock bracket (GPU idle) -------------------------------
+    if (clock_bracket_end(&clk, stream, h_gpuTs) != 0)
+        fprintf(stderr, "WARNING: end-of-run calibration failed\n");
+    const double calibStd = clk.std_start;
+
+    // ---- W values ----------------------------------------------------------
+    /* Only jobs that actually ran: `completed`, not nJobs.  (The sibling
+     * binaries write `anyFail ? wakeupTimes.size() : nJobs`, which is the same
+     * number either way because the vector is sized nJobs up front.) */
+    const int rows = anyFail ? completed : nJobs;
+    std::vector<int64_t> wVals;
+    wVals.reserve((size_t)rows);
+    for (int i = 0; i < rows; ++i) {
+        if (h_completion[(size_t)i] == 0) continue;
+        wVals.push_back(((int64_t)wakeupTimes[(size_t)i]
+                         + clk.offset_at(wakeupTimes[(size_t)i]))
+                        - (int64_t)h_completion[(size_t)i]);
+    }
+
+    double wMean = 0.0;
+    for (int64_t v : wVals) wMean += (double)v;
+    if (!wVals.empty()) wMean /= (double)wVals.size();
+    double wVar = 0.0;
+    for (int64_t v : wVals) { const double d = (double)v - wMean; wVar += d * d; }
+    const double wStd = (wVals.size() > 1)
+                      ? std::sqrt(wVar / (double)(wVals.size() - 1))
+                      : 0.0;
+
+    // ---- CSV ---------------------------------------------------------------
+    printf("# CPU Wakeup Latency (GCAPS)\n");
+    printf("# device: %s\n",              prop.name);
+    printf("# exec_us: %llu\n",           (unsigned long long)execUs);
+    printf("# n_jobs: %d\n",              nJobs);
+    printf("# warmup: %d\n",              warmup);
+    printf("# ioctl_enabled: %d\n",       ioctlEnabled);
+    printf("# realtime: %s\n",            realtime ? "yes" : "no");
+    printf("# rt_applied: %s\n",          realtime ? (rtEarly ? "before_context"
+                                                              : "after_context")
+                                                   : "none");
+    printf("# pin_cpu: %d\n",             pinCpu);
+    printf("# wait_primitive: %s\n",      waitOnEvent ? "cudaEventSynchronize"
+                                                      : "cudaStreamSynchronize");
+    printf("# blocking_sync: %s\n",       blockingSync ? "yes" : "no");
+    printf("# release_period_us: %llu\n", (unsigned long long)releasePeriodUs);
+    printf("# release_late: %d  (grid points already past; want 0)\n", late);
+    clock_bracket_report(&clk);
+    printf("# W_i = (wakeup_ns + cpu_to_gpu_offset_ns) - completion_ns\n");
+    printf("# completion_ns is the SEGMENT KERNEL's last-instruction stamp\n");
+    printf("# wakeup_ns is taken when the segment-end wait returns, BEFORE the "
+           "remove ioctl — see the file header\n");
+    printf("# seg_begin_ioctl_ns / seg_end_ioctl_ns: the GCAPS add/remove "
+           "runlist ioctls, wall, host-side (0 when -i 0)\n");
+
+    if (wStd > 0.0 && calibStd >= wStd / 10.0)
+        printf("# CALIBRATION_WARNING: calibration_std=%.1f ns, "
+               "measurement_std=%.1f ns\n", calibStd, wStd);
+
+    printf("job_id,completion_ns,wakeup_ns,W_ns,seg_begin_ioctl_ns,"
+           "seg_end_ioctl_ns\n");
+
+    int wIdx = 0;
+    for (int i = 0; i < rows; ++i) {
+        if (h_completion[(size_t)i] == 0) continue;
+        printf("%d,%llu,%llu,%lld,%llu,%llu\n",
+               i,
+               (unsigned long long)h_completion[(size_t)i],
+               (unsigned long long)wakeupTimes[(size_t)i],
+               (long long)wVals[(size_t)wIdx++],
+               (unsigned long long)addIoctlNs[(size_t)i],
+               (unsigned long long)remIoctlNs[(size_t)i]);
+    }
+    fflush(stdout);
+
+    cudaEventDestroy(evStop);
+    cudaEventDestroy(evStart);
+    cudaStreamDestroy(stream);
+    cudaFreeHost(h_gpuTs);
+    cudaFreeHost(h_completion);
+    cudaFree(d_dur);
+    if (fd >= 0) close(fd);
+
+    return anyFail ? EXIT_FAILURE : EXIT_SUCCESS;
+}
