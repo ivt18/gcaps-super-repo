@@ -211,7 +211,7 @@ echo "  staged variants in $VARIANT_DIR:"
 ls -1 "$VARIANT_DIR"/nvgpu_*.ko 2>/dev/null | sed 's/^/      /' || echo "      (none)"
 
 # =============================================================================
-step "patches"
+(( PROBE )) || step "patches"
 # =============================================================================
 
 # Idempotent by construction: a reverse dry-run that succeeds means the patch is
@@ -293,10 +293,24 @@ if (( PROBE )); then
     printf '  %-9s %-13s %-8s %-8s %-13s\n' \
            "rev" "ioctl_ctrl.c" "sched.c" "sched.h" "nvgpu-ctrl.h"
     any=0
-    for rev in $(git -C "$SELF_DIR" log --format=%h --all -- \
-                     gcaps_driver_patch/ioctl_ctrl.c.patch \
-                     gcaps_driver_patch/sched.c.patch \
-                     gcaps_driver_patch/sched.h.patch 2>/dev/null); do
+    # `git -C DIR log -- PATHSPEC` resolves PATHSPEC relative to DIR, not to the
+    # repo root, and this script lives in a subdirectory -- so ask git where the
+    # root is rather than assuming.
+    REPO_ROOT="$(git -C "$SELF_DIR" rev-parse --show-toplevel 2>/dev/null)"
+    [[ -n "$REPO_ROOT" ]] || fail "$SELF_DIR is not inside a git checkout, so the
+      patch history cannot be read.  Use --from-pristine instead."
+
+    revs="$(git -C "$REPO_ROOT" log --format=%h --all -- \
+                gcaps_driver_patch/ioctl_ctrl.c.patch \
+                gcaps_driver_patch/sched.c.patch \
+                gcaps_driver_patch/sched.h.patch 2>/dev/null)"
+    # An EMPTY list must not fall through to "no revision matches" -- that reads
+    # as "hand-edited" when the truth is "nothing was examined".
+    [[ -n "$revs" ]] || fail "found no revisions touching the patch files under
+      $REPO_ROOT.  Is this a full checkout of gcaps-super-repo (a shallow or
+      partial clone would do this)?  Use --from-pristine instead."
+
+    for rev in $revs; do
         cells=(); allok=1
         for entry in "${PATCH_TARGETS[@]}"; do
             rel="${entry%%:*}"; pf="${entry##*:}"
