@@ -13,6 +13,15 @@
 #   ./build_gcaps_r35.sh                  # patch + build + verify + stage
 #   sudo ./build_gcaps_r35.sh             # ... and install over nvgpu.ko
 #   ./build_gcaps_r35.sh --no-install     # patch + build + verify + stage only
+#   sudo ./build_gcaps_r35.sh --repatch-from 50cbdb4   # tree is at an OLDER revision
+#
+# --repatch-from REV is the normal case on a board that has built GCAPS before:
+# $KG is already patched, but at the PREVIOUS revision of these patch files, so
+# the current ones neither apply forward nor reverse.  Given the git revision the
+# tree was last patched at, each file is reverse-patched with THAT revision's
+# patch and forward-patched with the current one, on a temp copy, moved into
+# place only if both succeed.  Verified to produce a file byte-identical to
+# patching a pristine tree with the current patch set.
 #
 # THREE BUILD TRAPS this script guards, each of which has cost a cycle before:
 #
@@ -57,16 +66,26 @@ MAX_M_PATH_LEN=48
 
 CHECK_ONLY=0
 DO_INSTALL=1
-for a in "$@"; do
-    case "$a" in
-        --check)      CHECK_ONLY=1 ;;
-        --no-install) DO_INSTALL=0 ;;
-        --variant=*)  VARIANT="${a#*=}" ;;
-        -j*)          JOBS="${a#-j}" ;;
-        -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
-        *)            echo "unknown argument: $a" >&2; exit 1 ;;
+REPATCH_FROM=""
+while (( $# )); do
+    case "$1" in
+        --check)           CHECK_ONLY=1 ;;
+        --no-install)      DO_INSTALL=0 ;;
+        --variant)         [[ $# -ge 2 ]] || { echo "--variant needs a value" >&2; exit 1; }
+                           VARIANT="$2"; shift ;;
+        --variant=*)       VARIANT="${1#*=}" ;;
+        --repatch-from)    [[ $# -ge 2 ]] || { echo "--repatch-from needs a revision" >&2; exit 1; }
+                           REPATCH_FROM="$2"; shift ;;
+        --repatch-from=*)  REPATCH_FROM="${1#*=}" ;;
+        -j*)               JOBS="${1#-j}" ;;
+        -h|--help)         sed -n '2,50p' "$0"; exit 0 ;;
+        *)                 echo "unknown argument: $1" >&2; exit 1 ;;
     esac
+    shift
 done
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "  ok    $*"; }
@@ -129,9 +148,19 @@ ok "all 4 patch targets and patch files present"
 
 [[ -f "$MODULE_PATH" ]] && ok "install target $MODULE_PATH" \
     || warn "install target not found: $MODULE_PATH"
-[[ -f "$MODULE_PATH.prebuilt-bak" ]] \
-    && ok "pristine backup present (.prebuilt-bak)" \
-    || warn "no .prebuilt-bak beside the module — one will be made on first install"
+
+# A pristine (stock NVIDIA) module to fall back to.  Do NOT manufacture one from
+# whatever is currently installed -- on a board that has run GCAPS before that is
+# a GCAPS build, and calling it "prebuilt" would destroy the only real reference.
+PRISTINE_REF=""
+for cand in "$MODULE_PATH.prebuilt-bak" "$VARIANT_DIR/nvgpu_original.ko" \
+            "$VARIANT_DIR/nvgpu_prebuilt.ko"; do
+    [[ -f "$cand" ]] && { PRISTINE_REF="$cand"; break; }
+done
+[[ -n "$PRISTINE_REF" ]] \
+    && ok "pristine module available: $(basename "$PRISTINE_REF")" \
+    || warn "no pristine module found beside $VARIANT_DIR — keep one, it is the
+      only way back to the stock driver without re-flashing"
 
 echo "  staged variants in $VARIANT_DIR:"
 ls -1 "$VARIANT_DIR"/nvgpu_*.ko 2>/dev/null | sed 's/^/      /' || echo "      (none)"
@@ -146,34 +175,86 @@ step "patches"
 # half-apply.  Default fuzz is kept deliberately: these patches carry
 # "\ No newline at end of file" markers mid-file and legitimately apply at
 # fuzz 1-2.
-apply_patch() {
+classify() {   # -> APPLIED | PRISTINE | UNKNOWN
     local tgt="$KG/$1" pf="$SELF_DIR/$2"
+    if patch -R -p0 -f --dry-run "$tgt" < "$pf" >/dev/null 2>&1; then echo APPLIED
+    elif patch -p0 -f --dry-run "$tgt" < "$pf" >/dev/null 2>&1;   then echo PRISTINE
+    else echo UNKNOWN; fi
+}
 
-    if patch -R -p0 -f --dry-run "$tgt" < "$pf" >/dev/null 2>&1; then
-        ok "already applied: $1"
-        return
-    fi
-    if ! patch -p0 -f --dry-run "$tgt" < "$pf" >/dev/null 2>&1; then
-        fail "cannot apply $2 to $1 — the tree is neither pristine nor patched.
-      Restore $tgt from ${tgt}.gcaps-orig, or re-extract the sources."
-    fi
+# UNKNOWN on a board that has built GCAPS before almost always means "patched at
+# an older revision of these files", not "corrupted".  --repatch-from names the
+# revision it was last patched at: reverse THAT patch out, apply the current one.
+# All of it on a temp copy, moved into place only if both halves succeed, so a
+# failure leaves the tree exactly as it was.
+migrate_patch() {
+    local rel="$1" pf="$2" tgt="$KG/$1"
+    local oldpf="$WORK/old_$pf" tmp="$WORK/mig_$(basename "$rel")"
+
+    git -C "$SELF_DIR" show "$REPATCH_FROM:gcaps_driver_patch/$pf" > "$oldpf" 2>/dev/null \
+        || fail "cannot read $pf at revision '$REPATCH_FROM'.
+      Is $SELF_DIR inside the git repo, and is that revision valid?"
+
+    cp -p "$tgt" "$tmp"
+    patch -s -R -p0 -f "$tmp" < "$oldpf" >/dev/null 2>&1 \
+        || fail "$rel is not at revision '$REPATCH_FROM' either — cannot reverse it.
+      Find the revision the tree WAS patched at, or restore $rel from a
+      pristine source tree and re-run without --repatch-from."
+
+    # $tmp is pristine at exactly this point -- the only moment a genuine
+    # unpatched copy exists, so keep one for future runs to classify against.
+    [[ -f "$tgt.gcaps-orig" ]] || cp -p "$tmp" "$tgt.gcaps-orig"
+
+    patch -s -p0 -f "$tmp" < "$SELF_DIR/$pf" >/dev/null 2>&1 \
+        || fail "reversed $rel back to pristine, but the CURRENT patch will not
+      apply to it.  Tree left untouched."
+
+    cp -p "$tgt" "$tgt.gcaps-prev"
+    mv "$tmp" "$tgt"
+    ok "repatched from $REPATCH_FROM: $rel  (previous kept as $(basename "$tgt").gcaps-prev)"
+}
+
+apply_patch() {
+    local rel="$1" pf="$2" tgt="$KG/$1"
+
+    case "$(classify "$rel" "$pf")" in
+        APPLIED)  ok "already applied: $rel"; return ;;
+        PRISTINE) ;;
+        UNKNOWN)
+            [[ -n "$REPATCH_FROM" ]] || fail "cannot apply $pf to $rel — the tree is neither pristine nor patched.
+      If this board has built GCAPS before, the tree is patched at an OLDER
+      revision of these files: re-run with --repatch-from <git-rev>, naming the
+      revision it was last patched at.  Otherwise restore $rel from a pristine
+      source tree."
+            migrate_patch "$rel" "$pf"
+            return ;;
+    esac
+
     [[ -f "$tgt.gcaps-orig" ]] || cp -p "$tgt" "$tgt.gcaps-orig"
-    patch -p0 -f "$tgt" < "$pf" >/dev/null \
-        || fail "patch reported success in dry-run but failed for real: $1"
-    ok "patched: $1  (original kept as $(basename "$tgt").gcaps-orig)"
+    patch -p0 -f "$tgt" < "$SELF_DIR/$pf" >/dev/null \
+        || fail "patch passed its dry-run but failed for real: $rel"
+    ok "patched: $rel  (original kept as $(basename "$tgt").gcaps-orig)"
 }
 
 if (( CHECK_ONLY )); then
+    n_unknown=0
     for entry in "${PATCH_TARGETS[@]}"; do
         tgt="${entry%%:*}"; pf="${entry##*:}"
-        if patch -R -p0 -f --dry-run "$KG/$tgt" < "$SELF_DIR/$pf" >/dev/null 2>&1; then
-            ok "would skip (already applied): $tgt"
-        elif patch -p0 -f --dry-run "$KG/$tgt" < "$SELF_DIR/$pf" >/dev/null 2>&1; then
-            ok "would apply: $tgt"
-        else
-            warn "would FAIL: $tgt (tree neither pristine nor patched)"
-        fi
+        case "$(classify "$tgt" "$pf")" in
+            APPLIED)  ok   "would skip (already applied): $tgt" ;;
+            PRISTINE) ok   "would apply: $tgt" ;;
+            UNKNOWN)  warn "would FAIL: $tgt (neither pristine nor patched)"
+                      (( n_unknown++ )) ;;
+        esac
     done
+    if (( n_unknown )); then
+        echo
+        echo "  $n_unknown file(s) are patched at some OTHER revision of these patches."
+        echo "  That is the normal state on a board that has built GCAPS before."
+        echo "  Re-run naming the revision the tree was last patched at, e.g."
+        echo "      sudo $0 --repatch-from <git-rev>"
+        echo "  (git log --oneline -- gcaps_driver_patch/ lists the candidates)"
+    fi
     echo; echo "== --check: nothing was modified =="
     exit 0
 fi
@@ -250,11 +331,15 @@ if [[ $EUID -ne 0 ]]; then
     exit 0
 fi
 
-# Only ever create .prebuilt-bak from a module we have NOT installed, or the
-# pristine NVIDIA build is lost the second time this runs.
-if [[ -f "$MODULE_PATH" && ! -f "$MODULE_PATH.prebuilt-bak" ]]; then
-    cp -p "$MODULE_PATH" "$MODULE_PATH.prebuilt-bak"
-    ok "saved pristine module as $(basename "$MODULE_PATH").prebuilt-bak"
+# Snapshot whatever is installed right now, under a name that says exactly that.
+# It is NOT called .prebuilt-bak: on a board that has run GCAPS before the
+# installed module is a GCAPS build, and naming it "prebuilt" would overwrite the
+# one real route back to the stock driver.  The pristine reference found during
+# preflight (e.g. nvgpu_original.ko) is left strictly alone.
+if [[ -f "$MODULE_PATH" ]]; then
+    BAK="$MODULE_PATH.bak-$(date +%Y%m%d_%H%M%S)"
+    cp -p "$MODULE_PATH" "$BAK"
+    ok "previous module saved as $(basename "$BAK")"
 fi
 
 cp -p "$STAGED" "$MODULE_PATH" || fail "install failed"
