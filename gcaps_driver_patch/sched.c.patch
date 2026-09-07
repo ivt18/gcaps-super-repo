@@ -36,7 +36,7 @@
  
  int gk20a_sched_ctrl_init(struct gk20a *g)
 \ No newline at end of file
-@@ -620,12 +648,21 @@
+@@ -620,12 +648,24 @@
  		goto free_recent;
  	}
  
@@ -45,6 +45,9 @@
 +		pr_warn("gk20a_sched_rl_ctrl_init failed!");
 +		return err;
 +	}
++
++	/* the drain path for the per-ioctl GCAPS_EV records */
++	gcaps_ev_proc_init();
 +
  	nvgpu_cond_init(&sched->readout_wq);
  
@@ -59,10 +62,12 @@
  
  	return 0;
 \ No newline at end of file
-@@ -653,5 +690,8 @@
+@@ -653,5 +690,10 @@
  	nvgpu_mutex_destroy(&sched->control_lock);
  	nvgpu_mutex_destroy(&sched->busy_lock);
  
++	gcaps_ev_proc_exit();
++
 +	nvgpu_mutex_destroy(&sched->sync_fence_lock);
 +	rt_mutex_destroy(&sched->cs_lock);
 +

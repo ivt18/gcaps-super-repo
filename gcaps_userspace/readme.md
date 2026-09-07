@@ -157,10 +157,11 @@ directory. `taskset_response_overhead.pdf` is the per-task distribution of
 interference (the last dominates for low-priority tasks); it is the end-to-end
 counterpart to the isolated driver-measured ε in `epsilon.pdf`.
 
-If a captured `taskset_gcaps_events.log` is also present (written by
-`measure_preempt_overhead.py --run taskset`), the plotter additionally draws
-`epsilon.pdf` — the driver-measured GCAPS ε (runlist-update overhead, α+θ): an
-`elapsed_us` histogram split into the no-op vs runlist-reload modes (à la the
+If a captured `taskset_gcaps_events.log` is also present (drained from
+`/proc/gcaps_events` by `measure_preempt_overhead.py --run taskset`), the
+plotter additionally draws `epsilon.pdf` — the driver-measured GCAPS ε
+(runlist-update overhead, α+θ): an ε
+histogram split into the no-op vs runlist-reload modes (à la the
 paper's Fig. 12) plus a per-task ε box plot — and, attributing ε per release
 (the add+remove ioctls inside each GPU segment), splits the red "overhead" band
 into ε (red) + other latency (grey) in the breakdown and Gantt. Without the log,
@@ -208,22 +209,38 @@ lower-priority one is running (i.e. a real GCAPS preemption):
 
 ### Driver instrumentation
 This needs the **extended driver patch** (rebuild + redeploy the `nvgpu` module —
-see [`gcaps_driver_patch`](../gcaps_driver_patch/readme.md)). On top of the
-original `process <pid> elapsed time: <us>` line, `nvgpu_ioctl_runlist_update_rt_prio`
-now emits one structured record per ioctl:
+see [`gcaps_driver_patch`](../gcaps_driver_patch/readme.md)).
+`nvgpu_ioctl_runlist_update_rt_prio` records one structured entry per ioctl:
 ```
-GCAPS_EV ts=<ns> cpid=<pid> prio=<n> add=<0|1> rlupd=<0|1> elapsed_us=<eps> preempted=<pid|-1> resumed=<pid|-1>
+GCAPS_EV ts=<ns> cpid=<pid> prio=<n> add=<0|1> rlupd=<0|1> elapsed_us=<eps> preempted=<pid|-1> resumed=<pid|-1> elapsed_ns=<eps_ns>
 ```
 - `ts` — `ktime_get()` ns (same clock base as userspace `CLOCK_MONOTONIC`).
 - `add` — 1 entering a GPU segment, 0 leaving it.
 - `rlupd` — 1 if a real runlist reload happened (separates scheduling work from
   no-op bookkeeping calls; explains the bimodal ε distribution).
 - `elapsed_us` — duration of the critical section (GCAPS ε).
+- `elapsed_ns` — the same interval, untruncated. The no-op path (`rlupd=0`) is
+  sub-microsecond, so `elapsed_us` reported that whole mode as a flat 0. Every
+  script here prefers `elapsed_ns` and falls back to `elapsed_us`, so captures
+  from the older driver still parse.
 - `preempted` — pid evicted to *pending* by this higher-priority add (a real
   preemption), or −1. `resumed` — pid re-admitted to the runlist on a remove.
 
 The `preempted`/`resumed` pairs (matched by pid) reconstruct each job's
 **suspended intervals**, which is what makes (2) possible.
+
+**Read the records from `/proc/gcaps_events`, not from `dmesg`.** They are
+stored into a lock-free ring rather than `printk`-ed from inside the critical
+section, which is what kept `printk` cost out of the reported ε and out of the
+benchmark's response window; see the driver readme. Reading needs no privilege,
+resetting does:
+```bash
+cat /proc/gcaps_events        # "#" summary + one GCAPS_EV line per record
+: > /proc/gcaps_events        # reset the ring (root)
+```
+The `#` summary line reports `dropped=` — records the 8192-entry ring overwrote
+before the drain. Every script warns when it is non-zero; if you see it, shorten
+`-d` or raise `GCAPS_EV_RING_SIZE` in the patch before trusting the ε.
 
 ### Build
 ```bash
@@ -233,9 +250,10 @@ make workloadTasksetGcaps          # the realistic 7-task taskset (now also logs
 
 ### Run + analyse
 Same prerequisites as the taskset above (`nvpmodel -m 0 && jetson_clocks`,
-`sched_rt_runtime_us=-1`, always `-s 1`). The script clears `dmesg`, runs the
-benchmark under GCAPS (`-i 1 -s 1`), captures the `GCAPS_EV` lines and joins them
-with the benchmark trace. Needs `sudo` (SCHED_FIFO + reading the kernel log):
+`sched_rt_runtime_us=-1`, always `-s 1`). The script resets
+`/proc/gcaps_events`, runs the benchmark under GCAPS (`-i 1 -s 1`), drains the
+ring and joins the records with the benchmark trace. Needs `sudo` (SCHED_FIFO +
+resetting the ring):
 ```bash
 # controlled microbenchmark — cleanest per-preemption numbers
 sudo python3 scripts/measure_preempt_overhead.py --run microbench -d 30
@@ -255,6 +273,10 @@ python3 scripts/measure_preempt_overhead.py \
     --events results/workloadBench/preempt_gcaps_events.log \
     --trace  results/workloadBench/preempt_gcaps_trace.csv
 ```
+`--events` takes any text holding `GCAPS_EV` lines — a `/proc/gcaps_events`
+drain or an old `dmesg` capture. `--from-dmesg` restores the old capture path
+for a driver loaded with `gcaps_ev_printk=1`; it is strictly worse (printk back
+on the ioctl path, and ~860 records of log buffer against the ring's 8192).
 
 ### Interpreting the output
 - **(1)** reports ε distributions; the headline is `preempting add (a real
@@ -297,8 +319,15 @@ python3 scripts/measure_preempt_overhead.py \
   min/median for comparison.
 
 For the simpler whole-distribution ε (all ioctl calls, not preemption-specific),
-[`scripts/analyse_gcaps_overhead.py`](scripts/analyse_gcaps_overhead.py) still
-works and now also parses the `GCAPS_EV` `elapsed_us` field.
+[`scripts/analyse_gcaps_overhead.py`](scripts/analyse_gcaps_overhead.py) reads
+the ring directly — `python3 scripts/analyse_gcaps_overhead.py` with no argument
+drains `/proc/gcaps_events`; a file argument or piped input is used instead when
+given, so saved drains and legacy `dmesg` captures still work.
+
+Both scripts share [`scripts/gcaps_events.py`](scripts/gcaps_events.py), which
+owns the record format, the `elapsed_ns`/`elapsed_us` preference and the
+reset/drain helpers — so there is one parser to change if the record grows a
+field.
 
 ## References
 [1] Yidi Wang, Cong Liu, Daniel Wong, and Hyoseung Kim. GCAPS: GPU Context-Aware Preemptive Priority-based Scheduling for Real-Time Tasks. In Euromicro Conference on Real-Time Systems (ECRTS), 2024.

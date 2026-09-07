@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Measure GCAPS preemption overhead from the patched driver's GCAPS_EV log plus a
-benchmark trace.  Two quantities are reported:
+Measure GCAPS preemption overhead from the patched driver's GCAPS_EV event ring
+plus a benchmark trace.  Two quantities are reported:
 
   (1) Scheduling + context-switch / preemption overhead.
-      Each runlist-update ioctl logs a line like
+      Each runlist-update ioctl records a line like
 
           GCAPS_EV ts=<ns> cpid=<pid> prio=<n> add=<0|1> rlupd=<0|1> \
-                   elapsed_us=<eps> preempted=<pid|-1> resumed=<pid|-1>
+                   elapsed_us=<eps> preempted=<pid|-1> resumed=<pid|-1> \
+                   elapsed_ns=<eps_ns>
 
-      `elapsed_us` is the duration of the ioctl critical section, which performs
+      into the driver's event ring, which this script drains from
+      /proc/gcaps_events after the run.  The record is no longer printk'd from
+      inside the critical section, so it no longer inflates the ε it reports
+      (nor the blocking every other task sees).  See scripts/gcaps_events.py.
+
+      `elapsed_ns` is the duration of the ioctl critical section, which performs
       the runlist reload and (with wait_for_finish) the GPU-side switch.  The
       events whose `preempted` names a real victim are the ones where a running
       lower-priority job was actually evicted by a higher-priority arrival; their
@@ -32,8 +38,8 @@ benchmark trace.  Two quantities are reported:
 
 Usage
 -----
-Run a benchmark and analyse it (needs the patched driver, sudo, and the
-kernel-log readable; clears dmesg first):
+Run a benchmark and analyse it (needs the patched driver and sudo; resets the
+driver's event ring first, then drains it):
 
     sudo python3 scripts/measure_preempt_overhead.py --run microbench -d 30
     sudo python3 scripts/measure_preempt_overhead.py --run taskset   -d 30
@@ -44,28 +50,30 @@ Analyse already-captured data (no device needed):
         --events results/workloadBench/preempt_gcaps_events.log \
         --trace  results/workloadBench/preempt_gcaps_trace.csv
 
-`--events` accepts any text containing GCAPS_EV lines (e.g. `dmesg` output or a
-saved `dmesg | grep GCAPS_EV`).  The trace kind (microbench vs taskset) is
-detected from its CSV header.
+`--events` accepts any text containing GCAPS_EV lines — a /proc/gcaps_events
+drain, or an old `dmesg`/`dmesg | grep GCAPS_EV` capture.  The trace kind
+(microbench vs taskset) is detected from its CSV header.
+
+`--from-dmesg` restores the old capture path (stream `dmesg --follow` during
+the run) for a driver loaded with gcaps_ev_printk=1.  It is strictly worse:
+printk sits back on the ioctl path, and the kernel log buffer holds ~860
+records against the ring's 8192.
 """
 
 import argparse
 import math
 import os
-import re
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gcaps_events
 
 # Percentile of non-preempted active time used as the warm-execution baseline.
 # Low enough to sit on the warm floor (immune to start-up warmup / contention,
 # which only inflate), not the noisy single minimum.
 BASELINE_PCTL = 20
-
-GCAPS_EV_RE = re.compile(
-    r"GCAPS_EV\s+ts=(\d+)\s+cpid=(-?\d+)\s+prio=(-?\d+)\s+add=(\d+)\s+"
-    r"rlupd=(\d+)\s+elapsed_us=(-?\d+)\s+preempted=(-?\d+)\s+resumed=(-?\d+)"
-)
 
 
 # --------------------------------------------------------------------------- #
@@ -125,18 +133,21 @@ class Event:
     __slots__ = ("ts", "cpid", "prio", "add", "rlupd", "eps", "preempted",
                  "resumed")
 
-    def __init__(self, m):
-        (self.ts, self.cpid, self.prio, self.add, self.rlupd, self.eps,
-         self.preempted, self.resumed) = (
-            int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)),
-            int(m.group(5)), int(m.group(6)), int(m.group(7)), int(m.group(8)))
+    def __init__(self, d):
+        self.ts = d["ts"]
+        self.cpid = d["cpid"]
+        self.prio = d["prio"]
+        self.add = d["add"]
+        self.rlupd = d["rlupd"]
+        # microseconds, float: derived from elapsed_ns when the driver gave it,
+        # so the sub-microsecond no-op ioctls are no longer all exactly 0.
+        self.eps = d["eps_us"]
+        self.preempted = d["preempted"]
+        self.resumed = d["resumed"]
 
 
 def parse_events(text):
-    evs = [Event(m) for m in (GCAPS_EV_RE.search(l) for l in text.splitlines())
-           if m]
-    evs.sort(key=lambda e: e.ts)
-    return evs
+    return [Event(d) for d in gcaps_events.parse_text(text)]
 
 
 def reconstruct_suspend_intervals(events):
@@ -344,9 +355,9 @@ def report(events, rels, label, trace_path=None, baselines=None):
 
 
 # --------------------------------------------------------------------------- #
-# run a benchmark and capture the kernel log
+# run a benchmark and capture its events
 # --------------------------------------------------------------------------- #
-def run_and_capture(kind, duration, extra, events_path, no_sudo):
+def run_and_capture(kind, duration, extra, events_path, no_sudo, from_dmesg):
     sudo = [] if no_sudo else ["sudo"]
     if kind == "microbench":
         binary, trace = ("./preemptOverheadGcaps",
@@ -358,6 +369,27 @@ def run_and_capture(kind, duration, extra, events_path, no_sudo):
         sys.exit(f"{binary} not found — build it first (make {binary[2:]})")
 
     cmd = sudo + [binary, "-i", "1", "-s", "1", "-d", str(duration)] + extra
+
+    if not from_dmesg:
+        # Drain the driver's ring instead of the kernel log. The records are
+        # already in the ring when each ioctl returns, so there is nothing to
+        # stream and nothing to flush -- and the ring survives a busy run that
+        # would have wrapped the 128 KiB log buffer many times over.
+        gcaps_events.require("Or re-run with --from-dmesg.")
+        print(f"resetting {gcaps_events.PROC_PATH} ...")
+        gcaps_events.reset(sudo=not no_sudo)
+        print("running:", " ".join(cmd))
+        subprocess.run(cmd, check=False)
+        n_ev, n_drop = gcaps_events.drain(events_path)
+        print(f"  {n_ev} GCAPS_EV record(s) -> {events_path}")
+        if n_drop:
+            print(f"  WARNING: the ring overwrote {n_drop} older record(s). "
+                  f"Raise GCAPS_EV_RING_SIZE or shorten the run (-d); the "
+                  f"analysis below sees only the last {n_ev}.")
+        if n_ev == 0:
+            print("  WARNING: 0 events. Check: patched driver loaded? -i 1?")
+        return events_path, trace
+
     print("clearing kernel log (dmesg -C) ...")
     subprocess.run(sudo + ["dmesg", "-C"], check=False)
     # Stream the kernel log DURING the run (dmesg --follow) instead of dumping
@@ -388,6 +420,7 @@ def run_and_capture(kind, duration, extra, events_path, no_sudo):
     print(f"  {len(ev_lines)} GCAPS_EV line(s) -> {events_path}")
     if len(ev_lines) == 0:
         print("  WARNING: 0 events. Check: patched driver loaded? -i 1? "
+              "nvgpu loaded with gcaps_ev_printk=1? "
               "kernel.dmesg_restrict (read dmesg as root)?")
     return events_path, trace
 
@@ -396,13 +429,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", choices=("microbench", "taskset"),
-                    help="run this benchmark (GCAPS -i 1 -s 1) and capture dmesg")
+                    help="run this benchmark (GCAPS -i 1 -s 1) and drain "
+                         "/proc/gcaps_events")
     ap.add_argument("-d", "--duration", type=int, default=30,
                     help="experiment duration in seconds for --run (default 30)")
     ap.add_argument("--extra", default="",
                     help="extra args passed through to the benchmark binary")
     ap.add_argument("--no-sudo", action="store_true",
-                    help="do not prefix dmesg/benchmark with sudo")
+                    help="do not prefix the benchmark / ring reset with sudo")
+    ap.add_argument("--from-dmesg", action="store_true",
+                    help="capture from the kernel log instead of "
+                         "/proc/gcaps_events (needs nvgpu gcaps_ev_printk=1; "
+                         "puts printk back on the measured ioctl path)")
     ap.add_argument("--events", help="file containing GCAPS_EV lines to analyse")
     ap.add_argument("--trace", help="benchmark trace CSV to analyse")
     ap.add_argument("--baseline-ms", action="append", default=[],
@@ -421,7 +459,7 @@ def main():
         events_path = f"results/workloadBench/{tag}_gcaps_events.log"
         events_path, trace = run_and_capture(
             args.run, args.duration, args.extra.split() if args.extra else [],
-            events_path, args.no_sudo)
+            events_path, args.no_sudo, args.from_dmesg)
         args.events, args.trace = events_path, trace
 
     if not args.events or not args.trace:

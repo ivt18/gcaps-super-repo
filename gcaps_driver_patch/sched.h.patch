@@ -1,6 +1,6 @@
 --- sched.h	2024-05-16 15:33:24
 +++ sched_new.h	2024-05-16 16:25:04
-@@ -26,6 +26,29 @@
+@@ -26,6 +26,38 @@
  #include <nvgpu/lock.h>
  #include <nvgpu/cond.h>
  
@@ -26,6 +26,15 @@
 +};
 +
 +#include <linux/rtmutex.h>
++
++/*
++ * GCAPS measurement event ring: defined in os/linux/ioctl_ctrl.c next to the
++ * ioctl that fills it, drained through /proc/gcaps_events.  Declared here
++ * because os/linux/sched.c owns the entry's lifetime, and because
++ * ioctl_ctrl.c is built with -Werror=missing-prototypes.
++ */
++void gcaps_ev_proc_init(void);
++void gcaps_ev_proc_exit(void);
 +
  struct nvgpu_sched_ctrl {
  	struct nvgpu_mutex control_lock;

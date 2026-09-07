@@ -1,15 +1,18 @@
 --- ioctl_ctrl.c	2024-05-16 15:30:32
 +++ ioctl_ctrl_new.c	2024-05-16 16:25:35
-@@ -48,6 +48,7 @@
+@@ -48,6 +48,10 @@
  #include <nvgpu/gr/gr_instances.h>
  #include <nvgpu/gr/warpstate.h>
  #include <nvgpu/channel.h>
 +#include <nvgpu/runlist.h>
++#include <linux/moduleparam.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
  #include <nvgpu/pmu/pmgr.h>
  #include <nvgpu/pmu/therm.h>
  #include <nvgpu/power_features/pg.h>
 \ No newline at end of file
-@@ -2222,7 +2223,397 @@
+@@ -2222,7 +2223,597 @@
  
  	return err;
  }
@@ -76,6 +79,191 @@
 +			return true;
 +	}
 +	return false;
++}
++
++/*
++ * ===========================================================================
++ * GCAPS measurement instrumentation: the event ring
++ * ===========================================================================
++ *
++ * The per-ioctl measurement record used to be emitted with two pr_info() calls
++ * placed INSIDE the cs_lock critical section -- that is, inside the very
++ * interval the record reports, and inside the interval every other GCAPS task
++ * blocks on.  printk() is not a cheap call: it formats into the log buffer
++ * and, whenever a console is registered for its level, writes the line out
++ * synchronously (milliseconds on a serial console).  That cost landed in
++ *
++ *   - the cs_lock hold time, so it inflated the blocking every other task
++ *     suffers -- the GCAPS blocking term itself;
++ *   - the ioctl latency, which sits inside the benchmark's release-to-
++ *     segment-done window and therefore inside the reported
++ *     sched_preempt_overhead_ms.
++ *
++ * So the ioctl now only STORES the record: eight stores and one atomic
++ * increment, executed after rt_mutex_unlock() and after the end-of-section
++ * timestamp has been taken.  Nothing is formatted and nothing is printed on
++ * the measured path.  The ring is drained out of band, after the run, through
++ *
++ *     /proc/gcaps_events          # read  -> one GCAPS_EV line per record
++ *     echo > /proc/gcaps_events   # write -> reset the ring
++ *
++ * The text emitted on read is the old dmesg line plus one appended field, so
++ * analyse_gcaps_overhead.py and measure_preempt_overhead.py both parse it
++ * unchanged.  GCAPS_EV_RING_SIZE records is also ~10x what the default 128 KiB
++ * kernel log buffer could hold, which removes the "post-run dmesg dump only
++ * keeps the last few seconds" failure the capture script had to work around.
++ *
++ * gcaps_ev_printk=1 (module parameter, runtime writable) restores the legacy
++ * dmesg lines for debugging.  They are emitted after the unlock, but printk is
++ * still in the ioctl path when it is on -- do not measure with it set.
++ */
++#define GCAPS_EV_RING_SIZE  8192u	/* must be a power of two */
++#define GCAPS_EV_RING_MASK  (GCAPS_EV_RING_SIZE - 1u)
++
++struct gcaps_ev {
++	s64   ts_ns;		/* ktime at the end of the critical section */
++	s64   elapsed_ns;	/* WALL duration of the critical section */
++	pid_t cpid;
++	pid_t preempted;
++	pid_t resumed;
++	int   prio;
++	u8    add;
++	u8    rlupd;
++};
++
++static struct gcaps_ev gcaps_ev_ring[GCAPS_EV_RING_SIZE];
++static atomic64_t gcaps_ev_seq = ATOMIC64_INIT(0);
++
++static bool gcaps_ev_printk;
++module_param(gcaps_ev_printk, bool, 0644);
++MODULE_PARM_DESC(gcaps_ev_printk,
++	"also log each GCAPS_EV record via printk (debug only: printk on the ioctl path perturbs the timings it reports)");
++
++static void gcaps_ev_record(s64 ts_ns, s64 elapsed_ns, pid_t cpid,
++			    int prio, bool add, bool rlupd,
++			    pid_t preempted, pid_t resumed)
++{
++	u64 seq = (u64)atomic64_fetch_inc(&gcaps_ev_seq);
++	struct gcaps_ev *e = &gcaps_ev_ring[seq & GCAPS_EV_RING_MASK];
++
++	e->ts_ns      = ts_ns;
++	e->elapsed_ns = elapsed_ns;
++	e->cpid       = cpid;
++	e->prio       = prio;
++	e->add        = add ? 1 : 0;
++	e->rlupd      = rlupd ? 1 : 0;
++	e->preempted  = preempted;
++	e->resumed    = resumed;
++}
++
++/*
++ * /proc/gcaps_events -- oldest record first, preceded by one "#" summary line.
++ *
++ * DRAIN AFTER THE RUN.  The ring is written with no reader/writer
++ * synchronisation -- that is the whole point, the writer must stay a handful
++ * of stores -- so a record read while its slot is being overwritten can be
++ * torn.  The summary line reports how many records the ring lost to wrap.
++ */
++static u64 gcaps_ev_avail(void)
++{
++	u64 total = (u64)atomic64_read(&gcaps_ev_seq);
++
++	return (total < (u64)GCAPS_EV_RING_SIZE) ? total : (u64)GCAPS_EV_RING_SIZE;
++}
++
++static void *gcaps_ev_seq_start(struct seq_file *s, loff_t *pos)
++{
++	/* item 0 is the summary line, items 1..avail are records */
++	if (*pos < 0 || (u64)*pos > gcaps_ev_avail()) {
++		return NULL;
++	}
++	return (void *)(uintptr_t)(*pos + 1);
++}
++
++static void *gcaps_ev_seq_next(struct seq_file *s, void *v, loff_t *pos)
++{
++	(*pos)++;
++	if ((u64)*pos > gcaps_ev_avail()) {
++		return NULL;
++	}
++	return (void *)(uintptr_t)(*pos + 1);
++}
++
++static void gcaps_ev_seq_stop(struct seq_file *s, void *v)
++{
++}
++
++static int gcaps_ev_seq_show(struct seq_file *s, void *v)
++{
++	u64 idx = (u64)(uintptr_t)v - 1U;
++	u64 total = (u64)atomic64_read(&gcaps_ev_seq);
++	u64 avail = gcaps_ev_avail();
++	const struct gcaps_ev *e;
++
++	if (idx == 0U) {
++		seq_printf(s, "# GCAPS_EV records=%llu dropped=%llu ring=%u\n",
++			   avail, total - avail, GCAPS_EV_RING_SIZE);
++		return 0;
++	}
++
++	/* (total - avail) is the sequence number of the oldest surviving record */
++	e = &gcaps_ev_ring[((total - avail) + idx - 1U) & GCAPS_EV_RING_MASK];
++	seq_printf(s,
++		"GCAPS_EV ts=%lld cpid=%d prio=%d add=%u rlupd=%u elapsed_us=%lld preempted=%d resumed=%d elapsed_ns=%lld\n",
++		e->ts_ns, e->cpid, e->prio, (unsigned int)e->add,
++		(unsigned int)e->rlupd, e->elapsed_ns / 1000, e->preempted,
++		e->resumed, e->elapsed_ns);
++	return 0;
++}
++
++static const struct seq_operations gcaps_ev_seq_ops = {
++	.start = gcaps_ev_seq_start,
++	.next  = gcaps_ev_seq_next,
++	.stop  = gcaps_ev_seq_stop,
++	.show  = gcaps_ev_seq_show,
++};
++
++static int gcaps_ev_proc_open(struct inode *inode, struct file *file)
++{
++	return seq_open(file, &gcaps_ev_seq_ops);
++}
++
++/* any write resets the ring, so a capture can start from a known-empty state */
++static ssize_t gcaps_ev_proc_write(struct file *file, const char __user *buf,
++				   size_t len, loff_t *ppos)
++{
++	atomic64_set(&gcaps_ev_seq, 0);
++	return (ssize_t)len;
++}
++
++static const struct proc_ops gcaps_ev_proc_ops = {
++	.proc_open    = gcaps_ev_proc_open,
++	.proc_read    = seq_read,
++	.proc_lseek   = seq_lseek,
++	.proc_release = seq_release,
++	.proc_write   = gcaps_ev_proc_write,
++};
++
++static struct proc_dir_entry *gcaps_ev_proc_entry;
++
++void gcaps_ev_proc_init(void)
++{
++	if (gcaps_ev_proc_entry == NULL) {
++		gcaps_ev_proc_entry = proc_create("gcaps_events", 0644, NULL,
++						  &gcaps_ev_proc_ops);
++		if (gcaps_ev_proc_entry == NULL) {
++			pr_warn("GCAPS: could not create /proc/gcaps_events; "
++				"set gcaps_ev_printk=1 to fall back to dmesg");
++		}
++	}
++}
++
++void gcaps_ev_proc_exit(void)
++{
++	if (gcaps_ev_proc_entry != NULL) {
++		proc_remove(gcaps_ev_proc_entry);
++		gcaps_ev_proc_entry = NULL;
++	}
 +}
 +
 +/**
@@ -174,7 +362,7 @@
 +	bool exist = false;
 +	ktime_t start_time;
 +	ktime_t stop_time;
-+	s64 elapsed_time;
++	s64 elapsed_ns;
  
 +	pid_t pid_next = -1;
 +	int rt_prio_next = 0;
@@ -213,6 +401,7 @@
 +	}
 +
 +	rt_mutex_lock(&sched->cs_lock);
++	/* --- start of the timed section: nothing that formats or logs below --- */
 +	start_time = ktime_get();
 +	/* get tsgs of the excepted proc */
 +	for (i = 0; i < f->num_channels; i++) {
@@ -378,23 +567,37 @@
 +
 +done:
 +	stop_time = ktime_get();
-+	elapsed_time = ktime_to_ns(ktime_sub(stop_time, start_time)) / 1000; // us
-+	pr_info("process %d elapsed time: %lld", cpid, elapsed_time);
++	/* --- end of the timed section ------------------------------------- */
++	rt_mutex_unlock(&sched->cs_lock);
++
++	elapsed_ns = ktime_to_ns(ktime_sub(stop_time, start_time));
++
 +	/* GCAPS_EV: one structured record per ioctl for measure_preempt_overhead.py.
++	 * Stored, not printed -- see the event-ring comment above; read it back
++	 * from /proc/gcaps_events once the run is over.
 +	 *   ts          - ktime (ns), same clock base as userspace CLOCK_MONOTONIC
 +	 *   prio        - caller SCHED_FIFO rt_priority (1..99), -1 if unknown
 +	 *   add         - 1 = entering a GPU segment, 0 = leaving it
 +	 *   rlupd       - 1 = an actual runlist reload happened (scheduling work +
 +	 *                 any GPU-side preemption), 0 = bookkeeping only
-+	 *   elapsed_us  - duration of the critical section (GCAPS epsilon)
++	 *   elapsed_us  - wall duration of the critical section (GCAPS epsilon),
++	 *                 truncated to us for backwards compatibility
 +	 *   preempted   - pid evicted to pending by this add (a preemption), or -1
-+	 *   resumed     - pid re-admitted to the runlist by this remove, or -1 */
-+	pr_info("GCAPS_EV ts=%lld cpid=%d prio=%d add=%d rlupd=%d elapsed_us=%lld preempted=%d resumed=%d",
-+		ktime_to_ns(stop_time), cpid,
-+		caller_prio,
-+		add_req ? 1 : 0, rl_updated ? 1 : 0, elapsed_time,
-+		preempted_pid, resumed_pid);
-+	rt_mutex_unlock(&sched->cs_lock);
++	 *   resumed     - pid re-admitted to the runlist by this remove, or -1
++	 *   elapsed_ns  - the same interval, untruncated: the fast path (rlupd=0)
++	 *                 is sub-microsecond and used to be reported as 0 */
++	gcaps_ev_record(ktime_to_ns(stop_time), elapsed_ns, cpid, caller_prio,
++			add_req, rl_updated, preempted_pid, resumed_pid);
++
++	if (unlikely(gcaps_ev_printk)) {
++		pr_info("process %d elapsed time: %lld", cpid,
++			elapsed_ns / 1000);
++		pr_info("GCAPS_EV ts=%lld cpid=%d prio=%d add=%d rlupd=%d elapsed_us=%lld preempted=%d resumed=%d elapsed_ns=%lld",
++			ktime_to_ns(stop_time), cpid,
++			caller_prio,
++			add_req ? 1 : 0, rl_updated ? 1 : 0, elapsed_ns / 1000,
++			preempted_pid, resumed_pid, elapsed_ns);
++	}
 +
 +	/* The published patch never freed these on ANY path -- ~3 x bitmap_size
 +	 * of kernel memory leaked per ioctl call. */

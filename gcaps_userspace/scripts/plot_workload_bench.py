@@ -29,8 +29,9 @@ Console output:
     taskset GPU utilization U = Σ C_i/T_i, one table per series
 
 The driver-measured GCAPS ε (runlist-update overhead, α+θ — Def. 2 of the paper)
-is read from the captured GCAPS_EV kernel log (taskset_gcaps_events.log, written
-by measure_preempt_overhead.py --run taskset) when present. It drives a dedicated
+is read from the captured GCAPS_EV records (taskset_gcaps_events.log, drained
+from /proc/gcaps_events by measure_preempt_overhead.py --run taskset) when
+present. It drives a dedicated
 epsilon.pdf and, attributed per release (the add+remove ioctls inside each GPU
 segment), splits the red "overhead" band into ε (red) + other latency (grey) in
 the breakdown and Gantt. Absent the log, those fall back to the single overhead
@@ -41,7 +42,7 @@ Figures written to --results-dir:
                             (one panel per workload type, log y)
   sweep_overhead.pdf      — per-config sched+preempt overhead: response delta
                             (GCAPS - TSG) and GCAPS overhead
-  epsilon.pdf             — driver-measured ε: elapsed_us histogram (no-op vs
+  epsilon.pdf             — driver-measured ε: histogram (no-op vs
                             runlist-reload modes, à la the paper's Fig. 12) and
                             per-task ε box plot  [needs taskset_gcaps_events.log]
   taskset_mort.pdf        — MORT and mean response per task, GCAPS vs TSG
@@ -71,7 +72,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import re
+import sys
 from collections import defaultdict
 
 import matplotlib
@@ -79,6 +80,9 @@ matplotlib.use('Agg')
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gcaps_events
 
 GCAPS_COLOR = '#1f77b4'
 TSG_COLOR = '#ff7f0e'
@@ -101,13 +105,6 @@ OTHER_OVH_COLOR = '#9e9e9e' # grey   — other overhead (launch + GPU-side delay
 # suspended intervals out of the purple GPU block so preemptions are visible and
 # the purple then reads as GPU *actively executing* (matching the seq Gantt).
 SUSPENDED_COLOR = '#bcbd22' # olive  — suspended (preempted, GPU idle for this job)
-
-# One structured driver record per runlist-update ioctl (see the driver patch):
-#   GCAPS_EV ts=<ns> cpid=<pid> prio=<n> add=<0|1> rlupd=<0|1> \
-#            elapsed_us=<eps> preempted=<pid|-1> resumed=<pid|-1>
-GCAPS_EV_RE = re.compile(
-    r'GCAPS_EV\s+ts=(\d+)\s+cpid=(-?\d+)\s+prio=(-?\d+)\s+add=(\d+)\s+'
-    r'rlupd=(\d+)\s+elapsed_us=(-?\d+)\s+preempted=(-?\d+)\s+resumed=(-?\d+)')
 
 # Figure-width scaling for the (very wide) taskset Gantt, in inches per second
 # of trace time (override with --gantt-inches-per-sec).
@@ -185,26 +182,27 @@ def load_taskset(path: str) -> dict[str, dict[str, np.ndarray]] | None:
 
 
 def load_events(path: str) -> list[dict] | None:
-    """Parse GCAPS_EV lines from a captured kernel-log file ->
-    list of {ts, cpid, add, rlupd, eps_us, preempted, resumed}, sorted by ts.
-    None if absent/empty."""
+    """Parse GCAPS_EV records from a captured file (a /proc/gcaps_events drain,
+    or a legacy kernel-log capture) -> list of
+    {ts, cpid, prio, add, rlupd, eps_us, eps_ns, exact_ns, preempted, resumed},
+    sorted by ts.  None if absent/empty.
+
+    eps_us is a float: the driver reports elapsed_ns as well as the truncated
+    elapsed_us, and gcaps_events prefers it, so the no-op mode (sub-microsecond,
+    formerly a flat 0) has real values."""
     if not os.path.isfile(path):
         print(f'  [skip] {path} not found')
         return None
-    evs: list[dict] = []
     with open(path) as f:
-        for line in f:
-            m = GCAPS_EV_RE.search(line)
-            if m:
-                evs.append({'ts': int(m.group(1)), 'cpid': int(m.group(2)),
-                            'add': int(m.group(4)), 'rlupd': int(m.group(5)),
-                            'eps_us': int(m.group(6)),
-                            'preempted': int(m.group(7)),
-                            'resumed': int(m.group(8))})
+        text = f.read()
+    evs = gcaps_events.parse_text(text)
     if not evs:
-        print(f'  [skip] no GCAPS_EV lines in {path}')
+        print(f'  [skip] no GCAPS_EV records in {path}')
         return None
-    evs.sort(key=lambda e: e['ts'])
+    dropped = gcaps_events.dropped_in(text)
+    if dropped:
+        print(f'  [warn] the driver ring overwrote {dropped} record(s) before '
+              f'this drain; ε is over the {len(evs)} survivors only')
     return evs
 
 

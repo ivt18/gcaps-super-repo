@@ -2,13 +2,34 @@
 
 This folder includes the implementation of GCAPS approach in Tegra driver.
 
-> **Measurement instrumentation.** `ioctl_ctrl.c.patch` additionally emits a
+> **Measurement instrumentation.** `ioctl_ctrl.c.patch` additionally records a
 > structured `GCAPS_EV ts=... add=... rlupd=... elapsed_us=... preempted=...
-> resumed=...` line per runlist-update ioctl (alongside the original
-> `process <pid> elapsed time:` line). This is what
+> resumed=... elapsed_ns=...` entry per runlist-update ioctl. This is what
 > [`gcaps_userspace/scripts/measure_preempt_overhead.py`](../gcaps_userspace/readme.md#measuring-preemption-overhead)
 > uses to attribute per-preemption overhead and reconstruct suspend intervals.
 > Rebuild and redeploy `nvgpu.ko` (steps below) to pick it up.
+>
+> **The record is stored, not printed.** It used to be emitted by two
+> `pr_info()` calls placed *inside* the `cs_lock` critical section — inside the
+> interval the record reports, and inside the interval every other GCAPS task
+> blocks on. `printk()` formats into the log buffer and, if a console is
+> registered for its level, writes the line out synchronously (milliseconds on
+> a serial console), so that cost landed both in the reported ε and in the
+> benchmark's response window. The ioctl now only stores the record — eight
+> stores and one atomic increment, after `rt_mutex_unlock()` and after the
+> closing `ktime_get()` — into a lock-free 8192-entry ring, drained out of band:
+>
+> ```bash
+> cat /proc/gcaps_events        # "#" summary + one GCAPS_EV line per record
+> : > /proc/gcaps_events        # reset the ring (root)
+> ```
+>
+> 8192 records is over an order of magnitude more than the ~860 `GCAPS_EV` lines
+> that fit in the default 128 KiB kernel log buffer, so a busy run no longer
+> loses its early events. Load the module with `gcaps_ev_printk=1` to restore
+> the legacy `dmesg` lines (`process <pid> elapsed time:` included) for
+> debugging — but that puts `printk` back on the ioctl path, so do not measure
+> with it set.
 
 ## Test Environments
 - Nvidia Jetson Xavier NX

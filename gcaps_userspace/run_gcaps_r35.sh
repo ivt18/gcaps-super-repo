@@ -154,6 +154,23 @@ ok "run capped at ${TIMEOUT}s (watchdog ${WDT_SEC}s)"
 [[ -d /var/log/journal ]] && ok "journal is persistent" \
     || warn "journal is VOLATILE -- a reboot will destroy the crash log"
 
+# ---- 7. the driver's GCAPS_EV ring. The driver no longer printk's the records
+#         from inside the ioctl critical section (that inflated the epsilon it
+#         reported and the blocking every other task saw), so the post-run
+#         verification below reads the ring instead of the journal.
+GCAPS_EV_PROC=/proc/gcaps_events
+have_ev_ring=0
+if [[ $gcaps_mode -eq 1 ]]; then
+    if [[ -e "$GCAPS_EV_PROC" ]]; then
+        have_ev_ring=1
+        ok "event ring at $GCAPS_EV_PROC"
+    else
+        warn "no $GCAPS_EV_PROC -- driver predates the event ring.
+      Falling back to the journal, which needs nvgpu gcaps_ev_printk=1
+      and only holds the last few seconds of a busy run."
+    fi
+fi
+
 echo "== preflight passed =="
 [[ $CHECK_ONLY -eq 1 ]] && { echo "(--check: not running)"; exit 0; }
 [[ ${#ARGS[@]} -gt 0 ]] || fail "no arguments for ./main (e.g. -f taskset.csv -d 10 -i 1)"
@@ -162,23 +179,37 @@ cd "$RUN_DIR" || exit 1
 mkdir -p timelog
 START=$(date +%s)
 
+# Empty the ring so the counts below describe THIS run and nothing else.
+[[ $have_ev_ring -eq 1 ]] && : > "$GCAPS_EV_PROC"
+
 echo "== running: $MAIN ${ARGS[*]} =="
 timeout -s KILL "$TIMEOUT" "$MAIN" "${ARGS[@]}"
 rc=$?
 echo "== main exited rc=$rc ==" 
 [[ $rc -eq 137 ]] && echo "   (137 = killed by the ${TIMEOUT}s cap -- it HUNG)"
 
-# ---- 7. POST-RUN: did the driver actually see real-time priorities?
+# ---- 8. POST-RUN: did the driver actually see real-time priorities?
 #         This is what catches the fake pass after the fact.
 if [[ $gcaps_mode -eq 1 ]]; then
     echo "== post-run verification =="
-    EV=$(journalctl -k --since "@$START" --no-pager 2>/dev/null | grep GCAPS_EV)
-    n_ev=$(echo "$EV" | grep -c GCAPS_EV)
-    n_add=$(echo "$EV" | grep -c 'add=1')
-    n_rem=$(echo "$EV" | grep -c 'add=0')
-    n_rt=$(echo "$EV"  | grep -vc 'prio=0 ')
+    if [[ $have_ev_ring -eq 1 ]]; then
+        EV=$(grep GCAPS_EV "$GCAPS_EV_PROC" 2>/dev/null)
+        n_drop=$(sed -n 's/^#.*dropped=\([0-9]*\).*/\1/p' "$GCAPS_EV_PROC")
+    else
+        EV=$(journalctl -k --since "@$START" --no-pager 2>/dev/null | grep GCAPS_EV)
+        n_drop=0
+    fi
+    n_ev=$(grep -c GCAPS_EV <<< "$EV")
+    n_add=$(grep -c 'add=1' <<< "$EV")
+    n_rem=$(grep -c 'add=0' <<< "$EV")
+    # filter to GCAPS_EV first: an empty $EV is one empty line to <<<, which
+    # 'grep -v' would happily count as a non-zero-priority event
+    n_rt=$(grep GCAPS_EV <<< "$EV" | grep -vc 'prio=0 ')
     echo "  GCAPS_EV events : $n_ev   (add=1: $n_add, add=0: $n_rem)"
     echo "  non-zero prio   : $n_rt"
+    [[ "${n_drop:-0}" -gt 0 ]] && \
+        warn "the ring overwrote $n_drop record(s) -- shorten -d or raise
+      GCAPS_EV_RING_SIZE before trusting an epsilon from this run"
 
     if [[ "$n_ev" -eq 0 ]]; then
         echo "  *** VOID: no GCAPS_EV events -- the ioctl never reached the driver." >&2
