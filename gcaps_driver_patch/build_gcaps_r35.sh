@@ -10,10 +10,17 @@
 # vermagic-correct by construction.
 #
 #   ./build_gcaps_r35.sh --check          # preflight only, changes nothing
-#   ./build_gcaps_r35.sh                  # patch + build + verify + stage
-#   sudo ./build_gcaps_r35.sh             # ... and install over nvgpu.ko
-#   ./build_gcaps_r35.sh --no-install     # patch + build + verify + stage only
-#   sudo ./build_gcaps_r35.sh --repatch-from 50cbdb4   # tree is at an OLDER revision
+#   ./build_gcaps_r35.sh                  # patch, build, verify, stage, install
+#   ./build_gcaps_r35.sh --no-install     # stop after staging
+#   ./build_gcaps_r35.sh --repatch-from 50cbdb4   # tree is at an OLDER revision
+#
+# DO NOT run this under sudo.  It refuses to start as root, for two reasons:
+# sudo rewrites HOME, so $KG/$KN would default to /root/kg and /root/kn; and
+# patching and building as root leaves root-owned files scattered through your
+# source tree, which breaks the next ordinary `make` there.  The script calls
+# sudo itself for the two steps that need it (staging into /lib/modules and
+# depmod), and validates the credential up front so a password prompt cannot
+# interrupt the build.
 #
 # --repatch-from REV is the normal case on a board that has built GCAPS before:
 # $KG is already patched, but at the PREVIOUS revision of these patch files, so
@@ -61,8 +68,10 @@ JOBS="${JOBS:-$(nproc)}"
 LOG="${LOG:-/var/tmp/gcaps_build_$(date +%Y%m%d_%H%M%S).log}"
 
 # M= path longer than this risks trap 3.  723 objects x (P+40) chars, embedded
-# twice, must stay under 128 KB => P < ~50.
-MAX_M_PATH_LEN=48
+# twice, must stay under 128 KB => P < ~50.  Overridable because the object
+# count is not a constant of nature -- but raise it only with that arithmetic
+# redone, not to silence the guard.
+MAX_M_PATH_LEN="${MAX_M_PATH_LEN:-48}"
 
 CHECK_ONLY=0
 DO_INSTALL=1
@@ -112,6 +121,15 @@ step "preflight"
 
 ok "kernel $KREL"
 
+if [[ $EUID -eq 0 ]]; then
+    fail "do not run this as root.
+      sudo rewrites HOME, so \$KG would default to /root/kg — and patching and
+      building as root leaves root-owned files in your source tree that break
+      your next ordinary build there.
+      Run it as yourself: '$0'.  It calls sudo only to install."
+fi
+ok "running as $(id -un) (not root)"
+
 [[ -d "$KDIR" ]] || fail "kernel headers not found: $KDIR
       Install nvidia-l4t-kernel-headers matching $KREL."
 ok "headers $KDIR"
@@ -138,6 +156,16 @@ fi
 ok "build path ${#M_PATH} chars (limit $MAX_M_PATH_LEN)"
 
 command -v patch >/dev/null || fail "patch(1) not installed"
+
+# Ask for the sudo credential NOW rather than letting a password prompt appear
+# minutes later, after the build, with the terminal scrolled past the question.
+SUDO=""
+if (( DO_INSTALL && ! CHECK_ONLY )); then
+    command -v sudo >/dev/null || fail "sudo not installed (use --no-install)"
+    sudo -v || fail "sudo credential refused — re-run with --no-install to build only"
+    SUDO="sudo"
+    ok "sudo available for the install step"
+fi
 
 for entry in "${PATCH_TARGETS[@]}"; do
     tgt="${entry%%:*}"; pf="${entry##*:}"
@@ -252,7 +280,7 @@ if (( CHECK_ONLY )); then
         echo "  $n_unknown file(s) are patched at some OTHER revision of these patches."
         echo "  That is the normal state on a board that has built GCAPS before."
         echo "  Re-run naming the revision the tree was last patched at, e.g."
-        echo "      sudo $0 --repatch-from <git-rev>"
+        echo "      $0 --repatch-from <git-rev>"
         echo "  (git log --oneline -- gcaps_driver_patch/ lists the candidates)"
     fi
     echo; echo "== --check: nothing was modified =="
@@ -308,10 +336,10 @@ step "stage"
 # =============================================================================
 
 STAGED="$VARIANT_DIR/nvgpu_$VARIANT.ko"
-if [[ -w "$VARIANT_DIR" ]]; then
-    cp -p "$KO" "$STAGED" && ok "staged $STAGED"
+if [[ -n "$SUDO" ]] || [[ -w "$VARIANT_DIR" ]]; then
+    $SUDO cp -p "$KO" "$STAGED" && ok "staged $STAGED"
 else
-    warn "cannot write $VARIANT_DIR (need root) — leaving the build at $KO"
+    warn "cannot write $VARIANT_DIR — leaving the build at $KO"
     STAGED="$KO"
 fi
 
@@ -325,12 +353,6 @@ if (( ! DO_INSTALL )); then
     exit 0
 fi
 
-if [[ $EUID -ne 0 ]]; then
-    echo "  not root — skipping install."
-    echo "  To install:  sudo cp $STAGED $MODULE_PATH && sudo depmod -a && sudo reboot"
-    exit 0
-fi
-
 # Snapshot whatever is installed right now, under a name that says exactly that.
 # It is NOT called .prebuilt-bak: on a board that has run GCAPS before the
 # installed module is a GCAPS build, and naming it "prebuilt" would overwrite the
@@ -338,13 +360,13 @@ fi
 # preflight (e.g. nvgpu_original.ko) is left strictly alone.
 if [[ -f "$MODULE_PATH" ]]; then
     BAK="$MODULE_PATH.bak-$(date +%Y%m%d_%H%M%S)"
-    cp -p "$MODULE_PATH" "$BAK"
+    $SUDO cp -p "$MODULE_PATH" "$BAK"
     ok "previous module saved as $(basename "$BAK")"
 fi
 
-cp -p "$STAGED" "$MODULE_PATH" || fail "install failed"
+$SUDO cp -p "$STAGED" "$MODULE_PATH" || fail "install failed"
 ok "installed $MODULE_PATH  (sha256 $sha…)"
-depmod -a && ok "depmod -a"
+$SUDO depmod -a && ok "depmod -a"
 
 cat <<EOF
 
