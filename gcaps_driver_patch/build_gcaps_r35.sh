@@ -426,7 +426,34 @@ if [[ "$vm" != "$KREL"* ]]; then
 fi
 ok "vermagic $vm"
 
-sha="$(sha256sum "$KO" | cut -c1-8)"
+# =============================================================================
+step "strip"
+# =============================================================================
+
+# The build output carries full debug_info: ~245 MB against ~4.4 MB stripped.
+# It loads either way, but finit_module reads the WHOLE file into kernel memory
+# at load time, so a 56x larger module is a pointless risk on a shared board --
+# and every previously qualified module here is the stripped ~4.4 MB kind.
+# Only the INSTALLED copy is stripped; the unstripped build stays at $KO, which
+# is what you want for symbolising an oops.
+INSTALL_KO="$WORK/nvgpu.ko"
+cp -p "$KO" "$INSTALL_KO"
+if command -v strip >/dev/null; then
+    before=$(stat -c%s "$INSTALL_KO")
+    strip --strip-debug "$INSTALL_KO" || fail "strip --strip-debug failed"
+    after=$(stat -c%s "$INSTALL_KO")
+    ok "stripped $((before / 1048576)) MB -> $((after / 1048576)) MB"
+    ok "unstripped build kept at $KO (for oops symbolisation)"
+    # Re-verify AFTER stripping -- this, not $KO, is the file that gets loaded.
+    vms="$(modinfo -F vermagic "$INSTALL_KO" 2>/dev/null)"
+    [[ "$vms" == "$KREL"* ]] \
+        || fail "the stripped module reports vermagic '$vms' — refusing to install it"
+    ok "stripped module still reports vermagic $vms"
+else
+    warn "strip(1) not found — installing the unstripped $(stat -c%s "$INSTALL_KO") byte module"
+fi
+
+sha="$(sha256sum "$INSTALL_KO" | cut -c1-8)"
 ok "sha256 $sha…"
 
 # =============================================================================
@@ -435,7 +462,7 @@ step "stage"
 
 STAGED="$VARIANT_DIR/nvgpu_$VARIANT.ko"
 if [[ -n "$SUDO" ]] || [[ -w "$VARIANT_DIR" ]]; then
-    $SUDO cp -p "$KO" "$STAGED" && ok "staged $STAGED"
+    $SUDO cp -p "$INSTALL_KO" "$STAGED" && ok "staged $STAGED"
 else
     warn "cannot write $VARIANT_DIR — leaving the build at $KO"
     STAGED="$KO"
