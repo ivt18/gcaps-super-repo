@@ -186,15 +186,28 @@ if [[ ${PLATFORM:-1} -eq 1 ]]; then
         fi
     fi
 
+    # jetson_clocks gets a timeout and a closed stdin.  Sending its output to
+    # /dev/null is what turns a stall or a prompt into an unexplained freeze with
+    # no indication of which preflight step is stuck, so: announce first, bound
+    # the wait, and report the exit status.
     if command -v jetson_clocks >/dev/null 2>&1; then
-        if jetson_clocks --store "$clock_store" >/dev/null 2>&1; then
+        echo "  ..    storing current clocks (jetson_clocks --store)"
+        if timeout 60 jetson_clocks --store "$clock_store" </dev/null >/dev/null 2>&1; then
             clock_stored=1
-            jetson_clocks >/dev/null 2>&1 \
-                && ok "clocks LOCKED to max (restored on exit)" \
-                || warn "jetson_clocks failed -- DVFS still active, timings will be noisy"
+            echo "  ..    locking clocks (jetson_clocks)"
+            rc_jc=0
+            timeout 60 jetson_clocks </dev/null >/dev/null 2>&1 || rc_jc=$?
+            if [[ $rc_jc -eq 0 ]]; then
+                ok "clocks LOCKED to max (restored on exit)"
+            elif [[ $rc_jc -eq 124 ]]; then
+                warn "jetson_clocks TIMED OUT after 60 s -- DVFS still active and
+      the clocks may be half-applied; timings will be noisy"
+            else
+                warn "jetson_clocks failed (rc=$rc_jc) -- DVFS still active"
+            fi
         else
-            warn "jetson_clocks --store failed -- NOT locking clocks, since they
-      could not be put back afterwards"
+            warn "jetson_clocks --store failed or timed out -- NOT locking clocks,
+      since they could not be put back afterwards"
         fi
     fi
 
@@ -241,7 +254,8 @@ restore_platform() {
     # jetson_clocks would undo the restored DVFS state.
     [[ -n "$nvpm_prior" ]] && nvpmodel -m "$nvpm_prior" >/dev/null 2>&1 \
         && echo "  restored nvpmodel mode $nvpm_prior"
-    [[ $clock_stored -eq 1 ]] && jetson_clocks --restore "$clock_store" >/dev/null 2>&1 \
+    [[ $clock_stored -eq 1 ]] \
+        && timeout 60 jetson_clocks --restore "$clock_store" </dev/null >/dev/null 2>&1 \
         && echo "  restored clocks from $clock_store"
     return 0
 }
