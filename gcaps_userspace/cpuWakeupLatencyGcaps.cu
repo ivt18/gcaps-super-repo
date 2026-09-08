@@ -84,6 +84,11 @@
  *   --no-pin              Do not pin.
  *   --rt-early            Apply SCHED_FIFO before the first CUDA call.
  *   --spin                Do NOT use blocking sync (GCAPS's default -b 0 mode).
+ *   --out FILE            Write the CSV here instead of stdout.  Needed when
+ *                         running under run_gcaps_r35.sh, which is MANDATORY
+ *                         for -i 1 (it makes SCHED_FIFO attainable despite
+ *                         CONFIG_RT_GROUP_SCHED and disables railgating) and
+ *                         whose own preflight output shares stdout.
  */
 
 #include <fcntl.h>
@@ -238,6 +243,7 @@ int main(int argc, char** argv)
     bool     waitOnEvent     = true;
     int      pinCpu          = DEFAULT_PIN_CPU;
     uint64_t releasePeriodUs = DEFAULT_RELEASE_PERIOD_US;
+    const char* outPath      = nullptr;
 
     /* Positional args are collected separately so that, unlike
      * cpuWakeupLatencyStreamBaseline, option order does not matter. */
@@ -255,6 +261,8 @@ int main(int argc, char** argv)
             pinCpu = atoi(argv[++i]);
         else if (strcmp(argv[i], "--release-period-us") == 0 && i + 1 < argc)
             releasePeriodUs = (uint64_t)atoll(argv[++i]);
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc)
+            outPath = argv[++i];
         else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc) {
             const char* w = argv[++i];
             if      (strcmp(w, "event")  == 0) waitOnEvent = true;
@@ -499,6 +507,16 @@ int main(int argc, char** argv)
                       : 0.0;
 
     // ---- CSV ---------------------------------------------------------------
+    // Reopened rather than passed around: every emit below is a printf, and the
+    // wrapper this must run under writes its own preflight to the same stdout.
+    if (outPath != nullptr) {
+        if (freopen(outPath, "w", stdout) == nullptr) {
+            fprintf(stderr, "cannot open --out %s (errno=%d)\n", outPath, errno);
+            return EXIT_FAILURE;
+        }
+        fprintf(stderr, "  CSV -> %s\n", outPath);
+    }
+
     printf("# CPU Wakeup Latency (GCAPS)\n");
     printf("# device: %s\n",              prop.name);
     printf("# exec_us: %llu\n",           (unsigned long long)execUs);
