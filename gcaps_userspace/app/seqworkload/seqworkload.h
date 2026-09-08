@@ -66,12 +66,28 @@ public:
 	void warmup();
 
 	const char* name() const { return name_; }
+
+	/* Per-phase CPU time (CLOCK_THREAD_CPUTIME_ID) accumulated over every
+	 * taskCallback(), so the CPU a GPU task spends ABOVE its emulated C_i can
+	 * be attributed to the calls that cause it.  The four phases are the four
+	 * statements of taskCallback():
+	 *   [0] seg_begin  cudaEventRecord + the GCAPS add ioctl
+	 *   [1] launch     cudaEventRecord + launchKernels()
+	 *   [2] seg_end    cudaEventRecord + cudaEventSynchronize + remove ioctl
+	 *   [3] elapsed    cudaEventElapsedTime
+	 * [5] is the count of calls and [4] the instrument's own cost, so the
+	 * perturbation is auditable rather than assumed. */
+	void cpuBreakdownNs(uint64_t out[6]) const;
 	/* GPU-segment time (ms) measured by cudaEvents on the last taskCallback. */
 	float lastGpuMs() const { return last_gpu_ms; }
 
 private:
 	void launchKernels();   /* enqueue this workload's kernels on `stream` */
 	bool verifyChecks();    /* per-type host-reference checks (D2H copies inside) */
+
+	/* phase CPU accumulators; see cpuBreakdownNs() */
+	uint64_t cb_cpu_[4] = {0, 0, 0, 0};
+	uint64_t cb_calls_  = 0;
 
 	SeqWlType    type;
 	unsigned int p1, p2;

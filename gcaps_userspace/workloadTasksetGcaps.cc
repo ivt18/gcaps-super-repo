@@ -145,10 +145,57 @@ static uint64_t host_ns()
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+static inline uint64_t thread_cpu_ns(bool* ok);
+
+/* Consume duration_ns of CPU TIME, not of wall time.
+ *
+ * The wall-bounded version this replaces (`end = host_ns() + d; while (host_ns()
+ * < end);`) silently shrank a task's execution time whenever it was preempted:
+ * wall advanced during the preemption but the thread's CPU clock did not, so the
+ * emulated C_i came out BELOW C_i and the task's utilisation read low.  That is
+ * backwards -- a preempted task should still execute for C_i and simply finish
+ * later.  Measured on a SCHED_OTHER run: cpu_only lost 18 ms over 5 s (33.13%
+ * against its 33.5% duty), and the loss grows with contention, which is exactly
+ * when the number matters most.
+ *
+ * CLOCK_THREAD_CPUTIME_ID is NOT vDSO-served -- each read is a real syscall,
+ * ~0.5-1 us -- so spinning directly on it would spend most of C_i inside
+ * clock_gettime.  Instead burn a bounded slice on the cheap vDSO CLOCK_MONOTONIC
+ * and re-check the CPU clock once per slice: at 200 us the check costs well under
+ * 1% of the slice, and any preemption inside a slice is picked up at its end and
+ * repaid by another iteration.  The clock reads' own CPU is inside the accounted
+ * total, so the loop self-corrects rather than overshooting.
+ *
+ * Falls back to the wall-bounded behaviour if the CPU clock is unavailable. */
+static constexpr uint64_t CPU_SPIN_SLICE_NS = 200000;   /* 200 us */
+
+static bool g_wall_bounded_ci = false;   /* -W: legacy wall-bounded C_i */
+
 static void cpu_busy_wait_ns(uint64_t duration_ns)
 {
-	const uint64_t end = host_ns() + duration_ns;
-	while (host_ns() < end) {}
+	if (g_wall_bounded_ci) {
+		const uint64_t end = host_ns() + duration_ns;
+		while (host_ns() < end) {}
+		return;
+	}
+
+	bool ok = true;
+	const uint64_t cpu0 = thread_cpu_ns(&ok);
+	if (!ok) {
+		const uint64_t end = host_ns() + duration_ns;
+		while (host_ns() < end) {}
+		return;
+	}
+
+	uint64_t consumed = 0;
+	while (consumed < duration_ns) {
+		uint64_t slice = duration_ns - consumed;
+		if (slice > CPU_SPIN_SLICE_NS) slice = CPU_SPIN_SLICE_NS;
+		const uint64_t wend = host_ns() + slice;
+		while (host_ns() < wend) {}
+		consumed = thread_cpu_ns(&ok) - cpu0;
+		if (!ok) break;
+	}
 }
 
 static void sleep_until_abs_ns(uint64_t target_ns)
@@ -351,12 +398,18 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 		char cpath[176];
 		snprintf(cpath, sizeof(cpath),
 		         "results/workloadBench/.cpu_%s_%d.csv", mode_tag, task_idx);
+		uint64_t bd[6] = {0, 0, 0, 0, 0, 0};
+		if (wl != nullptr) wl->cpuBreakdownNs(bd);
 		FILE* cf = fopen(cpath, "w");
 		if (cf) {
-			fprintf(cf, "%d,%s,%llu,%llu,%d\n", task_idx, td.name,
+			fprintf(cf, "%d,%s,%llu,%llu,%d,%llu,%llu,%llu,%llu,%llu,%llu\n",
+			        task_idx, td.name,
 			        (unsigned long long)(win_cpu1 - win_cpu0),
 			        (unsigned long long)(win_wall1 - g_sync_start_ns),
-			        cpu_clk_ok ? 1 : 0);
+			        cpu_clk_ok ? 1 : 0,
+			        (unsigned long long)bd[0], (unsigned long long)bd[1],
+			        (unsigned long long)bd[2], (unsigned long long)bd[3],
+			        (unsigned long long)bd[4], (unsigned long long)bd[5]);
 			fclose(cf);
 		}
 	}
@@ -426,7 +479,9 @@ static double compute_p95(std::vector<double>& v)
  * task's final period overran the end -- at most one period. */
 static void report_host_cpu(const char* mode_tag)
 {
-	struct Row { char name[48]; unsigned long long cpu, wall; int ok; };
+	struct Row { char name[48]; unsigned long long cpu, wall; int ok;
+	             unsigned long long segbeg, launch, segend, elapsed,
+	                                probe, calls; };
 	Row rows[NUM_TASKS];
 	int  nrows = 0;
 	unsigned long long total_cpu = 0, window = 0;
@@ -439,11 +494,15 @@ static void report_host_cpu(const char* mode_tag)
 		if (!cf) continue;
 		int idx = 0, ok = 0;
 		char nm[48] = {0};
-		unsigned long long c = 0, w = 0;
-		if (fscanf(cf, "%d,%47[^,],%llu,%llu,%d", &idx, nm, &c, &w, &ok) == 5) {
+		unsigned long long c = 0, w = 0, b0 = 0, b1 = 0, b2 = 0, b3 = 0,
+		                   pr = 0, ca = 0;
+		if (fscanf(cf, "%d,%47[^,],%llu,%llu,%d,%llu,%llu,%llu,%llu,%llu,%llu",
+		           &idx, nm, &c, &w, &ok, &b0, &b1, &b2, &b3, &pr, &ca) == 11) {
 			Row& r = rows[nrows++];
 			snprintf(r.name, sizeof(r.name), "%s", nm);
 			r.cpu = c; r.wall = w; r.ok = ok;
+			r.segbeg = b0; r.launch = b1; r.segend = b2; r.elapsed = b3;
+			r.probe = pr; r.calls = ca;
 			if (ok) {
 				total_cpu += c;
 				if (w > window) window = w;
@@ -489,6 +548,35 @@ static void report_host_cpu(const char* mode_tag)
 		if (hc)
 			fprintf(hc, "%s,task,%llu,%llu,%.4f,%d\n",
 			        r.name, r.cpu, r.wall, pct, r.ok);
+	}
+
+	/* Where a GPU task's CPU goes ABOVE its emulated C_i.  The four phases are
+	 * the four statements of SeqWorkload::taskCallback(); everything else in the
+	 * period is the C_i spin, which is exactly C_i by construction now that it
+	 * is CPU-bounded.  probe is this instrument's own five clock reads per call,
+	 * charged rather than hidden. */
+	bool any_gpu = false;
+	for (int i = 0; i < nrows; ++i) if (rows[i].calls) any_gpu = true;
+	if (any_gpu) {
+		printf("\nPer-period CPU inside taskCallback (us/call, "
+		       "CLOCK_THREAD_CPUTIME_ID)\n");
+		printf("%-16s %8s %10s %8s %9s %8s %7s\n", "Task", "calls",
+		       "seg_begin", "launch", "seg_end", "elapsed", "probe");
+		printf("%-16s %8s %10s %8s %9s %8s %7s\n", "----------------",
+		       "--------", "----------", "--------", "---------",
+		       "--------", "-------");
+		for (int i = 0; i < nrows; ++i) {
+			const Row& r = rows[i];
+			if (!r.calls) continue;
+			const double n = (double)r.calls;
+			printf("%-16s %8llu %10.2f %8.2f %9.2f %8.2f %7.2f\n", r.name,
+			       r.calls, r.segbeg / n / 1e3, r.launch / n / 1e3,
+			       r.segend / n / 1e3, r.elapsed / n / 1e3, r.probe / n / 1e3);
+		}
+		printf("  seg_begin = cudaEventRecord + GCAPS add ioctl;  "
+		       "launch = cudaEventRecord + kernels\n");
+		printf("  seg_end   = cudaEventRecord + cudaEventSynchronize + remove "
+		       "ioctl;  elapsed = cudaEventElapsedTime\n");
 	}
 	if (hc) {
 		fprintf(hc, "TOTAL,aggregate,%llu,%llu,%.4f,1\n",
@@ -582,7 +670,7 @@ int main(int argc, char** argv)
 	uint64_t duration_s = 30;
 	int gpu_limit = -1;   /* -1 = all GPU tasks; else activate only first N */
 	int opt;
-	while ((opt = getopt(argc, argv, "i:s:b:d:k:S:w:")) != EOF) {
+	while ((opt = getopt(argc, argv, "i:s:b:d:k:S:w:W")) != EOF) {
 		switch (opt) {
 			case 'i': ioctl_enabled = atoi(optarg); break;
 			case 's': suspension    = atoi(optarg); break;
@@ -591,6 +679,7 @@ int main(int argc, char** argv)
 			case 'k': gpu_limit     = atoi(optarg); break;
 			case 'S': g_period_scale = atof(optarg); break;
 			case 'w': g_warmup_runs = atoi(optarg); break;
+			case 'W': g_wall_bounded_ci = true; break;
 			default:  fprintf(stderr, "bad option\n"); return 1;
 		}
 	}

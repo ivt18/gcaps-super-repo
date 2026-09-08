@@ -379,19 +379,73 @@ void SeqWorkload::launchKernels()
 	}
 }
 
+/* Calling-thread CPU time.  Each GCAPS task is one thread in one forked
+ * process, so this is that task's CPU and it excludes CUDA's helper threads. */
+static inline uint64_t sw_thread_cpu_ns()
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Cost of ONE sw_thread_cpu_ns() read, measured on first use.  Called only from
+ * cpuBreakdownNs(), i.e. AFTER the measurement window has closed, so the
+ * calibration itself never lands in any reported figure. */
+static uint64_t sw_probe_cost_ns()
+{
+	static uint64_t cost = 0;
+	if (cost == 0) {
+		const int N = 256;
+		const uint64_t a = sw_thread_cpu_ns();
+		for (int i = 0; i < N; ++i) (void)sw_thread_cpu_ns();
+		const uint64_t b = sw_thread_cpu_ns();
+		cost = (b > a) ? (b - a) / (uint64_t)N : 1;
+	}
+	return cost;
+}
+
+void SeqWorkload::cpuBreakdownNs(uint64_t out[6]) const
+{
+	for (int i = 0; i < 4; ++i) out[i] = cb_cpu_[i];
+	/* five reads per call; charge them so the perturbation is auditable */
+	out[4] = 5ULL * cb_calls_ * sw_probe_cost_ns();
+	out[5] = cb_calls_;
+}
+
 void SeqWorkload::taskCallback(int insId, int nIter)
 {
 	int pid = getpid();
 
+	/* Five CPU-clock reads bracket the four phases.  CLOCK_THREAD_CPUTIME_ID
+	 * is a real syscall (~0.5-1 us), so this costs a few microseconds against
+	 * a period measured in milliseconds -- but it IS real CPU and it lands in
+	 * the task's total, so the cost is accumulated separately (cb_probe_ns_)
+	 * and reported rather than hidden. */
+	const uint64_t t0 = sw_thread_cpu_ns();
+
 	gcapsGpuSegBegin(fd, pid, sync_mode, ioctl_enabled);
+	const uint64_t t1 = sw_thread_cpu_ns();
+
 	cudaEventRecord(ev_start, stream);
 	launchKernels();
+	const uint64_t t2 = sw_thread_cpu_ns();
+
 	cudaEventRecord(ev_stop, stream);
 	gcapsGpuSegEnd(fd, pid, sync_mode, stream, ioctl_enabled);
+	const uint64_t t3 = sw_thread_cpu_ns();
 
 	/* gcapsGpuSegEnd already synchronised the stream, so ev_stop is ready. */
 	last_gpu_ms = 0.0f;
 	cudaEventElapsedTime(&last_gpu_ms, ev_start, ev_stop);
+	const uint64_t t4 = sw_thread_cpu_ns();
+
+	if (t0 && t4) {
+		cb_cpu_[0] += t1 - t0;
+		cb_cpu_[1] += t2 - t1;
+		cb_cpu_[2] += t3 - t2;
+		cb_cpu_[3] += t4 - t3;
+		cb_calls_++;
+	}
 }
 
 void SeqWorkload::warmup()
