@@ -458,8 +458,21 @@ int main(int argc, char** argv)
     fflush(stderr);
 
     // ---- End-of-run clock bracket (GPU idle) -------------------------------
+    // MUST be inside a GCAPS segment bracket.  clock_bracket_end() launches
+    // CALIB_N_SAMPLES stamp kernels, and by this point the last segment's
+    // REMOVE ioctl has run -- so this context's TSGs (compute AND copy engine)
+    // are off the runlist, where unbracketed GPU work is never redispatched and
+    // blocks forever.  That is the runlist-cache-desync mechanism documented on
+    // SeqWorkload::verify(), and it hung this binary after "Done." until the
+    // wrapper SIGKILLed it, losing the entire run's output.
+    if (ioctlEnabled && gcaps_runlist(fd, myPid, true, false) < 0)
+        fprintf(stderr, "WARNING: calibration add ioctl failed (errno=%d)\n", errno);
+
     if (clock_bracket_end(&clk, stream, h_gpuTs) != 0)
         fprintf(stderr, "WARNING: end-of-run calibration failed\n");
+
+    if (ioctlEnabled && gcaps_runlist(fd, myPid, false, false) < 0)
+        fprintf(stderr, "WARNING: calibration remove ioctl failed (errno=%d)\n", errno);
     const double calibStd = clk.std_start;
 
     // ---- W values ----------------------------------------------------------

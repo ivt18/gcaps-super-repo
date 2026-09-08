@@ -126,12 +126,24 @@ def require(hint=""):
 
 
 def reset(sudo=True):
-    """Empty the ring so a capture starts from a known state."""
-    cmd = (["sudo"] if sudo else []) + ["sh", "-c", f": > {PROC_PATH}"]
+    """Empty the ring so a capture starts from a known state.
+
+    The write must be a REAL write: the driver resets the ring in its write()
+    handler, and shell truncation (`: > file`) opens with O_TRUNC without ever
+    issuing one -- procfs ignores the truncate, so the ring survives and the
+    next capture silently includes the previous run's events.
+    """
+    cmd = (["sudo"] if sudo else []) + ["sh", "-c", f"echo > {PROC_PATH}"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit(f"could not reset {PROC_PATH}: {r.stderr.strip()}\n"
                  "  (resetting the ring needs root)")
+    # Confirm it actually emptied -- a silent no-op here corrupts every count.
+    with open(PROC_PATH) as f:
+        left = len(parse_text(f.read()))
+    if left:
+        sys.exit(f"{PROC_PATH} still holds {left} record(s) after reset; "
+                 "captures would include earlier runs")
 
 
 def drain(dest_path):

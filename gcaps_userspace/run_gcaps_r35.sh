@@ -193,7 +193,15 @@ mkdir -p timelog
 START=$(date +%s)
 
 # Empty the ring so the counts below describe THIS run and nothing else.
-[[ $have_ev_ring -eq 1 ]] && : > "$GCAPS_EV_PROC"
+# MUST be a real write: the driver resets on write(), and ': > file' truncates
+# via open(O_TRUNC) without ever issuing one, so it silently does nothing and
+# the next run's counts include the previous run's events.
+if [[ $have_ev_ring -eq 1 ]]; then
+    echo > "$GCAPS_EV_PROC"
+    left=$(grep -c '^GCAPS_EV' "$GCAPS_EV_PROC" 2>/dev/null || echo 0)
+    [[ "$left" -eq 0 ]] || warn "ring still holds $left record(s) after reset --
+      the post-run counts below will include earlier runs"
+fi
 
 echo "== running: $MAIN ${ARGS[*]} =="
 timeout -s KILL "$TIMEOUT" "$MAIN" "${ARGS[@]}"
