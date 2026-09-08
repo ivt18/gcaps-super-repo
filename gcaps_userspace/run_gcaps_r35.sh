@@ -21,6 +21,19 @@
 #   sudo ./run_gcaps_r35.sh --check              # preflight only, run nothing
 #   sudo ./run_gcaps_r35.sh --timeout 60 -f ... -d 20 -i 1
 #
+# To drive a binary other than ./main, the assignment must come AFTER sudo --
+# sudo's env_reset drops variables set before it, and the wrapper then silently
+# falls back to ./main (check the "ok binary ..." preflight line):
+#
+#   sudo GCAPS_MAIN=./workloadTasksetGcaps ./run_gcaps_r35.sh -i 1 -s 1 -d 10
+#
+# --timeout must stay UNDER the watchdog (120 s), so a binary whose legitimate
+# runtime exceeds that cannot be supervised here.  workloadTasksetGcaps is one:
+# its post-run verify serialises by GCAPS priority and mlp_1024x8 spends ~a
+# minute on a host-side reference pass.  Keep -d small.  A SIGKILL during that
+# phase does NOT lose data -- the per-task CSVs are written BEFORE verify runs
+# -- it only costs the correctness verdict.
+#
 # Unlike the JP7.2 wrapper this moves only ITSELF into the root cpu cgroup, so
 # it leaves no lasting change to your shell or session.
 
