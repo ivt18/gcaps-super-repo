@@ -198,7 +198,10 @@ START=$(date +%s)
 # the next run's counts include the previous run's events.
 if [[ $have_ev_ring -eq 1 ]]; then
     echo > "$GCAPS_EV_PROC"
-    left=$(grep -c '^GCAPS_EV' "$GCAPS_EV_PROC" 2>/dev/null || echo 0)
+    # grep -c PRINTS 0 and EXITS 1 when there are no matches, so '|| echo 0'
+    # appends a second line and $left becomes "0\n0" -- a [[ ]] syntax error.
+    left=$(grep -c '^GCAPS_EV' "$GCAPS_EV_PROC" 2>/dev/null || true)
+    left=${left:-0}
     [[ "$left" -eq 0 ]] || warn "ring still holds $left record(s) after reset --
       the post-run counts below will include earlier runs"
 fi
