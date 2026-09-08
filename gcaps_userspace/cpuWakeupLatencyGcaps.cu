@@ -32,15 +32,17 @@
  *   seg_end_ioctl_ns    = the remove ioctl      (GCAPS ε, wall, host-side)
  *   seg_begin_ioctl_ns  = the add ioctl         (paid before the kernel runs)
  *
- * THE WAIT PRIMITIVE is GCAPS's own — cudaEventSynchronize on the segment's
- * `stop` event, created with cudaEventBlockingSync, inside a context created
- * with cudaDeviceScheduleBlockingSync.  That is what `gcapsGpuSegEnd` plus
+ * THE WAIT PRIMITIVE is GCAPS's own and is NOT configurable here —
+ * cudaEventSynchronize on the segment's `stop` event, created with
+ * cudaEventBlockingSync, inside a context created with
+ * cudaDeviceScheduleBlockingSync.  That is exactly what `gcapsGpuSegEnd` plus
  * SeqWorkload's suspend mode (-b 1) do, so W_i is GCAPS's real wake path and
- * not an approximation of it.  The stream baseline instead blocks in
- * cudaStreamSynchronize.  `--wait stream` switches this binary to
- * cudaStreamSynchronize so that difference can be isolated: if the GCAPS and
- * Stream arms disagree, `--wait stream` says how much of the gap is the ioctl
- * path and how much is merely event-vs-stream sync.
+ * not an approximation of it.  There is deliberately no switch for this: GCAPS
+ * hard-codes cudaEventSynchronize in `gcapsGpuSegEnd`, so a stream-sync variant
+ * would measure a configuration GCAPS cannot be run in.  The stream BASELINE
+ * blocks in cudaStreamSynchronize because that is what a plain-streams program
+ * does; that difference belongs to the arms being compared, not to a knob
+ * inside this one.
  *
  * RELEASE CADENCE — jobs are released on an ABSOLUTE grid (t0 + i*period,
  * default 997 µs), matching both sibling binaries.  GCAPS has no monitor to
@@ -79,7 +81,6 @@
  *   --realtime            SCHED_FIFO 50 on the measuring thread; needed for -i 1.
  *   --warmup N            Throwaway releases before job 0.     (default: 10)
  *   --release-period-us N Absolute release grid period.        (default: 997)
- *   --wait event|stream   Wait primitive.                      (default: event)
  *   --cpu N               Pin the measuring thread to CPU N.   (default: 2)
  *   --no-pin              Do not pin.
  *   --rt-early            Apply SCHED_FIFO before the first CUDA call.
@@ -251,7 +252,6 @@ int main(int argc, char** argv)
     bool     realtime        = false;
     bool     rtEarly         = false;
     bool     blockingSync    = true;
-    bool     waitOnEvent     = true;
     int      pinCpu          = DEFAULT_PIN_CPU;
     uint64_t releasePeriodUs = DEFAULT_RELEASE_PERIOD_US;
     const char* outPath      = nullptr;
@@ -274,13 +274,6 @@ int main(int argc, char** argv)
             releasePeriodUs = (uint64_t)atoll(argv[++i]);
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc)
             outPath = argv[++i];
-        else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc) {
-            const char* w = argv[++i];
-            if      (strcmp(w, "event")  == 0) waitOnEvent = true;
-            else if (strcmp(w, "stream") == 0) waitOnEvent = false;
-            else { fprintf(stderr, "--wait expects 'event' or 'stream'\n");
-                   return EXIT_FAILURE; }
-        }
         else pos.push_back(argv[i]);
     }
     if (pos.size() >= 1) execUs = (uint64_t)atoll(pos[0]);
@@ -337,8 +330,7 @@ int main(int argc, char** argv)
                                                             : "off (TSG baseline)");
     fprintf(stderr, "  realtime     : %s%s\n", realtime ? "yes" : "no",
             rtEarly ? " (applied before context creation)" : "");
-    fprintf(stderr, "  wait         : %s\n",   waitOnEvent ? "cudaEventSynchronize"
-                                                           : "cudaStreamSynchronize");
+    fprintf(stderr, "  wait         : cudaEventSynchronize (GCAPS's own)\n");
     fprintf(stderr, "  blocking sync: %s\n",   blockingSync ? "yes" : "no (spin)");
     fflush(stderr);
 
@@ -413,8 +405,7 @@ int main(int argc, char** argv)
             fprintf(stderr, "WARNING: warm-up add ioctl failed (errno=%d)\n", errno);
         wgcBusyWaitStamp<<<1, 1, 0, stream>>>(d_dur, h_warm);
         cudaEventRecord(evStop, stream);
-        if (waitOnEvent) cudaEventSynchronize(evStop);
-        else             cudaStreamSynchronize(stream);
+        cudaEventSynchronize(evStop);
         if (ioctlEnabled && gcaps_runlist(fd, myPid, false, false) < 0)
             fprintf(stderr, "WARNING: warm-up remove ioctl failed (errno=%d)\n", errno);
     }
@@ -455,8 +446,7 @@ int main(int argc, char** argv)
 
         /* --- gcapsGpuSegEnd: event record, THE WAIT, then the remove ioctl -- */
         cudaEventRecord(evStop, stream);
-        const cudaError_t syncErr = waitOnEvent ? cudaEventSynchronize(evStop)
-                                                : cudaStreamSynchronize(stream);
+        const cudaError_t syncErr = cudaEventSynchronize(evStop);
         wakeupTimes[(size_t)i] = host_ns();
 
         if (syncErr != cudaSuccess) {
@@ -544,8 +534,7 @@ int main(int argc, char** argv)
                                                               : "after_context")
                                                    : "none");
     printf("# pin_cpu: %d\n",             g_pinned_cpu);
-    printf("# wait_primitive: %s\n",      waitOnEvent ? "cudaEventSynchronize"
-                                                      : "cudaStreamSynchronize");
+    printf("# wait_primitive: cudaEventSynchronize\n");
     printf("# blocking_sync: %s\n",       blockingSync ? "yes" : "no");
     printf("# release_period_us: %llu\n", (unsigned long long)releasePeriodUs);
     printf("# release_late: %d  (grid points already past; want 0)\n", late);
