@@ -20,6 +20,7 @@
 #   sudo ./run_gcaps_r35.sh -f taskset.csv -d 10 -i 1
 #   sudo ./run_gcaps_r35.sh --check              # preflight only, run nothing
 #   sudo ./run_gcaps_r35.sh --timeout 60 -f ... -d 20 -i 1
+#   sudo ./run_gcaps_r35.sh --no-platform ...    # leave clocks/cpuidle alone
 #
 # To drive a binary other than ./main, the assignment must come AFTER sudo --
 # sudo's env_reset drops variables set before it, and the wrapper then silently
@@ -70,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --check)   CHECK_ONLY=1; shift ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
+        --no-platform) PLATFORM=0; shift ;;
         *)         ARGS+=("$1"); shift ;;
     esac
 done
@@ -151,7 +153,103 @@ fi
 restore_railgate() {
     [[ $railgate_changed -eq 1 ]] && echo 1 > "$RAILGATE" 2>/dev/null && echo "  restored railgate_enable=1"
 }
-trap restore_railgate EXIT
+
+# ---- 4b. platform state: locked clocks, no deep idle
+#
+# WHY: measured on this board 2026-09-08 -- with the governor at schedutil and
+# c7 (5000 us exit latency) enabled, cpuWakeupLatencyGcaps reported a CPU<->GPU
+# clock calibration std of 17.9 us against a W_i of 27.6 us.  The calibration
+# was noisier than the quantity being measured, and the drift check EXCEEDED its
+# 10 us budget.  Same root cause as the rho_head overruns in the RTA work: they
+# vanished with clocks locked and c7 off.
+#
+# The board is SHARED and this is global state, so everything is saved and put
+# back on exit -- including on SIGINT/SIGTERM -- and --no-platform skips it.
+nvpm_prior=""
+clock_store="/var/tmp/gcaps_l4t_dfs.conf"
+clock_stored=0
+idle_disabled=()
+
+if [[ ${PLATFORM:-1} -eq 1 ]]; then
+    if command -v nvpmodel >/dev/null 2>&1; then
+        # 'nvpmodel -q' prints the mode NAME then the mode NUMBER; 0 is MAXN.
+        nvpm_prior=$(nvpmodel -q 2>/dev/null | sed -n '2p' | tr -dc '0-9')
+        if [[ -n "$nvpm_prior" && "$nvpm_prior" != "0" ]]; then
+            if nvpmodel -m 0 >/dev/null 2>&1; then
+                ok "nvpmodel mode $nvpm_prior -> 0 (MAXN, restored on exit)"
+            else
+                warn "nvpmodel -m 0 failed"; nvpm_prior=""
+            fi
+        else
+            ok "nvpmodel already mode ${nvpm_prior:-?}"
+            nvpm_prior=""          # nothing to put back
+        fi
+    fi
+
+    if command -v jetson_clocks >/dev/null 2>&1; then
+        if jetson_clocks --store "$clock_store" >/dev/null 2>&1; then
+            clock_stored=1
+            jetson_clocks >/dev/null 2>&1 \
+                && ok "clocks LOCKED to max (restored on exit)" \
+                || warn "jetson_clocks failed -- DVFS still active, timings will be noisy"
+        else
+            warn "jetson_clocks --store failed -- NOT locking clocks, since they
+      could not be put back afterwards"
+        fi
+    fi
+
+    # c7 is matched by NAME, not by state index -- the index is not guaranteed.
+    # Count the outcomes separately: "found none", "already off" and "could not
+    # write" are three different things, and collapsing them reports all-clear
+    # for a loop that examined nothing (which is what an unprivileged run did).
+    c7_total=0; c7_already=0
+    for st in /sys/devices/system/cpu/cpu*/cpuidle/state*/; do
+        [[ -r "$st/name" ]] || continue
+        [[ "$(cat "$st/name")" == "c7" ]] || continue
+        c7_total=$((c7_total + 1))
+        if [[ "$(cat "$st/disable" 2>/dev/null)" == "1" ]]; then
+            c7_already=$((c7_already + 1))
+            continue
+        fi
+        { echo 1 > "$st/disable"; } 2>/dev/null && idle_disabled+=("$st/disable")
+    done
+    n_dis=${#idle_disabled[@]}
+    n_fail=$((c7_total - c7_already - n_dis))
+    if (( c7_total == 0 )); then
+        warn "no c7 idle state found -- cannot rule out a deep-idle exit latency
+      in the measurements"
+    elif (( n_fail > 0 )); then
+        warn "could NOT disable c7 on $n_fail of $c7_total cpu(s) -- its 5 ms exit
+      latency will land in the timings"
+    elif (( n_dis > 0 )); then
+        ok "c7 deep idle DISABLED on $n_dis of $c7_total cpu(s) (restored on exit)"
+    else
+        ok "c7 deep idle already off on all $c7_total cpu(s)"
+    fi
+else
+    warn "--no-platform: clocks and cpuidle left alone -- expect a noisy clock
+      calibration and W_i you cannot trust"
+fi
+
+restore_platform() {
+    local n=0 f
+    for f in "${idle_disabled[@]:-}"; do
+        [[ -n "$f" ]] && { echo 0 > "$f"; } 2>/dev/null && n=$((n + 1))
+    done
+    (( n )) && echo "  restored c7 deep idle on $n cpu(s)"
+    # nvpmodel first: it re-clamps the frequency table, so restoring it after
+    # jetson_clocks would undo the restored DVFS state.
+    [[ -n "$nvpm_prior" ]] && nvpmodel -m "$nvpm_prior" >/dev/null 2>&1 \
+        && echo "  restored nvpmodel mode $nvpm_prior"
+    [[ $clock_stored -eq 1 ]] && jetson_clocks --restore "$clock_store" >/dev/null 2>&1 \
+        && echo "  restored clocks from $clock_store"
+    return 0
+}
+
+# ONE trap: a second 'trap ... EXIT' would REPLACE the first, silently leaving
+# the railgate (or the platform state) unrestored.
+cleanup() { restore_railgate; restore_platform; }
+trap cleanup EXIT INT TERM
 
 # ---- 5. keep the run inside the watchdog window
 if [[ -r /sys/class/watchdog/watchdog0/timeout ]]; then
