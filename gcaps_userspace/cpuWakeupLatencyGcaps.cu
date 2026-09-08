@@ -119,9 +119,17 @@ static constexpr int DEFAULT_PIN_CPU = 2;
 
 /* Release cadence — MUST MATCH the sibling binaries. */
 static constexpr uint64_t DEFAULT_RELEASE_PERIOD_US = 997;
-/* Non-exec part of a job cycle (launch + both ioctls + wake) — used only to
- * warn when the requested period is too short for the grid to hold. */
-static constexpr uint64_t RELEASE_CYCLE_SLACK_US    = 40;
+/* Non-exec part of a job cycle — used only to warn when the requested release
+ * period is too short for the grid to hold.
+ *
+ * With -i 0 that is a kernel launch plus the wake: tens of microseconds.  With
+ * -i 1 it is DOMINATED by the two GCAPS ioctls, each a full runlist reload with
+ * wait_for_finish — MEASURED on the R35.6.4 Orin at p50 295 us and max 436 us
+ * per ioctl over 500 solo jobs.  Using the -i 0 figure for both is why a 997 us
+ * grid silently degenerated to back-to-back releases (499 of 500 late) with the
+ * warning below never firing: 997 > 50 + 40, but the real cycle was ~1263 us. */
+static constexpr uint64_t RELEASE_CYCLE_SLACK_US       = 40;
+static constexpr uint64_t RELEASE_CYCLE_SLACK_IOCTL_US = 900;
 /* t0 is stamped this far in the FUTURE so job 0 actually sleeps to its grid
  * point instead of finding its deadline already past. */
 static constexpr uint64_t STARTUP_MARGIN_NS         = 10000000ULL;   // 10 ms
@@ -286,14 +294,19 @@ int main(int argc, char** argv)
      * degenerates to back-to-back releases (every sleep expires in the past)
      * and W_i is measured at one fixed phase of whatever periodic activity the
      * driver has, instead of over a uniform sweep of it. */
-    if (releasePeriodUs <= execUs + RELEASE_CYCLE_SLACK_US)
+    const uint64_t cycleSlackUs = ioctlEnabled ? RELEASE_CYCLE_SLACK_IOCTL_US
+                                               : RELEASE_CYCLE_SLACK_US;
+    if (releasePeriodUs <= execUs + cycleSlackUs)
         fprintf(stderr,
                 "WARNING: release period %llu us is not comfortably above the "
-                "job cycle (exec %llu us + ~%llu us of launch/ioctl/wake) — the "
-                "grid degenerates to back-to-back releases.\n",
+                "job cycle (exec %llu us + ~%llu us of launch%s/wake) — the grid "
+                "will degenerate to back-to-back releases and release_late will "
+                "count them.  Try --release-period-us %llu.\n",
                 (unsigned long long)releasePeriodUs,
                 (unsigned long long)execUs,
-                (unsigned long long)RELEASE_CYCLE_SLACK_US);
+                (unsigned long long)cycleSlackUs,
+                ioctlEnabled ? " + two GCAPS ioctls" : "",
+                (unsigned long long)(2 * (execUs + cycleSlackUs)));
 
     if (ioctlEnabled && !realtime)
         fprintf(stderr,
