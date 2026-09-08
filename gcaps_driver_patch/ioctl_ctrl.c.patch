@@ -12,7 +12,7 @@
  #include <nvgpu/pmu/therm.h>
  #include <nvgpu/power_features/pg.h>
 \ No newline at end of file
-@@ -2222,7 +2223,597 @@
+@@ -2222,7 +2223,600 @@
  
  	return err;
  }
@@ -584,8 +584,11 @@
 +	 *                 truncated to us for backwards compatibility
 +	 *   preempted   - pid evicted to pending by this add (a preemption), or -1
 +	 *   resumed     - pid re-admitted to the runlist by this remove, or -1
-+	 *   elapsed_ns  - the same interval, untruncated: the fast path (rlupd=0)
-+	 *                 is sub-microsecond and used to be reported as 0 */
++	 *   elapsed_ns  - the same interval, untruncated.  MEASURED under an
++	 *                 8-task load: the no-op path (rlupd=0, the reload loop
++	 *                 skipped) is ~28 us and a real reload ~1180 us, so the
++	 *                 us truncation costs a few percent at the small mode
++	 *                 rather than the "flat 0" an earlier comment claimed */
 +	gcaps_ev_record(ktime_to_ns(stop_time), elapsed_ns, cpid, caller_prio,
 +			add_req, rl_updated, preempted_pid, resumed_pid);
 +

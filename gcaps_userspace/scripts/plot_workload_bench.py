@@ -188,8 +188,8 @@ def load_events(path: str) -> list[dict] | None:
     sorted by ts.  None if absent/empty.
 
     eps_us is a float: the driver reports elapsed_ns as well as the truncated
-    elapsed_us, and gcaps_events prefers it, so the no-op mode (sub-microsecond,
-    formerly a flat 0) has real values."""
+    elapsed_us, and gcaps_events prefers it, so the small no-op mode (rlupd=0,
+    ~28 us) keeps its sub-microsecond digits."""
     if not os.path.isfile(path):
         print(f'  [skip] {path} not found')
         return None

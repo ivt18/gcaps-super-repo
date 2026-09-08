@@ -22,10 +22,13 @@ The line format is unchanged apart from one appended field:
              elapsed_us=<eps> preempted=<pid|-1> resumed=<pid|-1> \
              elapsed_ns=<eps_ns>
 
-`elapsed_ns` is the same interval untruncated.  It matters: the no-op path
-(rlupd=0) is sub-microsecond, so `elapsed_us` reported it as a flat 0.  Every
-reader here prefers `elapsed_ns` when present and falls back to `elapsed_us`,
-so old captures still parse.
+`elapsed_ns` is the same interval untruncated.  MEASURED under an 8-task load,
+epsilon is bimodal: ~28 us when the runlist membership did not change (rlupd=0,
+so the reload loop is skipped and only the bookkeeping scans run) against
+~1180 us for a real reload.  The us truncation therefore costs a few percent at
+the small mode -- not the "flat 0" this comment used to claim, which was reasoned
+from the code and never measured.  Every reader here prefers `elapsed_ns` when
+present and falls back to `elapsed_us`, so old captures still parse.
 
 The ring holds 8192 records — over an order of magnitude more than the ~860
 GCAPS_EV lines that fit in the default 128 KiB kernel log buffer, which is what
@@ -64,7 +67,7 @@ def parse_line(line):
     """One GCAPS_EV line -> dict, or None if the line is not one.
 
     `eps_us` is a float derived from elapsed_ns when the driver supplied it, so
-    sub-microsecond no-op ioctls are no longer all reported as exactly 0.
+    the small (rlupd=0, ~28 us) mode keeps its sub-microsecond digits.
     """
     m = GCAPS_EV_RE.search(line)
     if not m:

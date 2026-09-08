@@ -140,7 +140,7 @@ class Event:
         self.add = d["add"]
         self.rlupd = d["rlupd"]
         # microseconds, float: derived from elapsed_ns when the driver gave it,
-        # so the sub-microsecond no-op ioctls are no longer all exactly 0.
+        # so the small (rlupd=0, ~28 us) mode keeps its sub-us digits.
         self.eps = d["eps_us"]
         self.preempted = d["preempted"]
         self.resumed = d["resumed"]

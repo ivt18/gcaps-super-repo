@@ -219,8 +219,10 @@ GCAPS_EV ts=<ns> cpid=<pid> prio=<n> add=<0|1> rlupd=<0|1> elapsed_us=<eps> pree
 - `rlupd` — 1 if a real runlist reload happened (separates scheduling work from
   no-op bookkeeping calls; explains the bimodal ε distribution).
 - `elapsed_us` — duration of the critical section (GCAPS ε).
-- `elapsed_ns` — the same interval, untruncated. The no-op path (`rlupd=0`) is
-  sub-microsecond, so `elapsed_us` reported that whole mode as a flat 0. Every
+- `elapsed_ns` — the same interval, untruncated. ε is bimodal: measured under an
+  8-task load, ~28 µs when the runlist membership did not change (`rlupd=0`, the
+  reload loop skipped, only the bookkeeping scans run) against ~1180 µs for a
+  real reload. The µs truncation costs a few percent at the small mode. Every
   script here prefers `elapsed_ns` and falls back to `elapsed_us`, so captures
   from the older driver still parse.
 - `preempted` — pid evicted to *pending* by this higher-priority add (a real

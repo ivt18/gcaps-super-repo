@@ -35,9 +35,11 @@ captures still work:
     dmesg | grep -E 'GCAPS_EV|elapsed time' | python3 analyse_gcaps_overhead.py
 
 The driver's `elapsed_ns` field is preferred over `elapsed_us` when present.
-That matters at the small mode: the no-op IOCTL path is sub-microsecond, so
-`elapsed_us` truncated it to a flat 0 and made that mode unreadable.  Captures
-without `elapsed_ns` (older driver, or `gcaps_ev_printk=1` dmesg lines) fall
+That matters at the small mode: the no-op IOCTL path (rlupd=0) measures ~28 us
+against ~1180 us for a real reload, so the us truncation costs a few percent
+there.  (An earlier comment claimed this mode was sub-microsecond and truncated
+to a flat 0; that was reasoned from the code, never measured, and is wrong.)
+Captures without `elapsed_ns` (older driver, `gcaps_ev_printk=1` dmesg lines) fall
 back to microseconds, and the legacy `process <pid> elapsed time: <us>` line is
 used if no structured record is present at all.
 """
