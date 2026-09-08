@@ -191,6 +191,15 @@ if [[ ${PLATFORM:-1} -eq 1 ]]; then
     # no indication of which preflight step is stuck, so: announce first, bound
     # the wait, and report the exit status.
     if command -v jetson_clocks >/dev/null 2>&1; then
+        # jetson_clocks --store PROMPTS ("File ... already exists. Can I
+        # overwrite it? Y/N:") when the target exists -- /usr/bin/jetson_clocks
+        # line ~700.  With its output sent to /dev/null that prompt is invisible
+        # and 'read answer' blocks on the terminal, which is exactly how a run
+        # hung here with no indication of the step.  Closing stdin alone would
+        # only convert the hang into a permanent "cannot lock clocks", so remove
+        # the file first: it is ours (script-owned path), written fresh each run
+        # and consumed by the restore below.
+        rm -f "$clock_store"
         echo "  ..    storing current clocks (jetson_clocks --store)"
         if timeout 60 jetson_clocks --store "$clock_store" </dev/null >/dev/null 2>&1; then
             clock_stored=1
