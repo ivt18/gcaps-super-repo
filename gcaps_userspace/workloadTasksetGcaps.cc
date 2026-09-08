@@ -182,6 +182,37 @@ static constexpr uint64_t INIT_STAGGER_NS = 1000000000ULL; /* 1 s per task */
 // Child process: run one task for the experiment window, dump its trace rows.
 // ============================================================================
 
+/* CPU time of the CALLING THREAD.
+ *
+ * This is the GCAPS counterpart of the aggregate U that workloadTasksetBench
+ * emits, and it is measurable here for a reason worth stating: this harness
+ * creates no pthreads, so each GCAPS task is exactly ONE thread in one forked
+ * process.  CLOCK_THREAD_CPUTIME_ID on that thread is therefore precisely that
+ * task's CPU and EXCLUDES the CUDA driver's helper threads -- the same scope as
+ * seq's per-thread U, which sums only threads it created.
+ *
+ * The GCAPS ioctls ARE included: syscall execution is charged as system time to
+ * the calling thread.  Where seq splits its scheduling cost between task threads
+ * and a monitor thread, GCAPS has no monitor -- it schedules inside the driver,
+ * in each task's own syscall context -- so the whole of it lands here.  Same
+ * total scope, different distribution.
+ *
+ * What this deliberately does NOT capture is the CUDA driver's per-context
+ * helper threads.  GCAPS needs one PROCESS per task (the ioctl acts on a pid),
+ * so it pays 8 contexts' worth of them against seq's 1, and that is a real cost
+ * of the architecture.  scripts/bench/sample_cpu_util.py's process-subtree walk
+ * is the lens that sees it; the two numbers together decompose the difference.
+ */
+static inline uint64_t thread_cpu_ns(bool* ok)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+		if (ok) *ok = false;
+		return 0;
+	}
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
                      bool suspension, const char* mode_tag)
 {
@@ -257,6 +288,13 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 	uint32_t period_idx        = 0;
 	uint64_t next_period_start = g_sync_start_ns;
 
+	/* Window opens here: AFTER taskInit() and the warm-up runs, so context
+	 * bring-up is excluded.  Between this read and g_sync_start_ns the thread
+	 * only sleeps, and sleeping costs no CPU, so this is the CPU-at-window-open
+	 * even though the sleep happens inside the loop below. */
+	bool cpu_clk_ok = true;
+	const uint64_t win_cpu0 = thread_cpu_ns(&cpu_clk_ok);
+
 	while (host_ns() < end_ns) {
 		const uint64_t period_start_ns = next_period_start;
 		sleep_until_abs_ns(period_start_ns);
@@ -300,6 +338,27 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 		first_period = false;
 		++period_idx;
 		next_period_start += period_ns;
+	}
+
+	const uint64_t win_cpu1  = thread_cpu_ns(&cpu_clk_ok);
+	const uint64_t win_wall1 = host_ns();
+
+	/* Per-thread CPU for this task, in its own file rather than the trace
+	 * fragment: merge_and_summarise() copies every fragment line verbatim into
+	 * the trace CSV, so a scalar row there would corrupt it.  Written before
+	 * the verify phase for the same reason the fragment is. */
+	{
+		char cpath[176];
+		snprintf(cpath, sizeof(cpath),
+		         "results/workloadBench/.cpu_%s_%d.csv", mode_tag, task_idx);
+		FILE* cf = fopen(cpath, "w");
+		if (cf) {
+			fprintf(cf, "%d,%s,%llu,%llu,%d\n", task_idx, td.name,
+			        (unsigned long long)(win_cpu1 - win_cpu0),
+			        (unsigned long long)(win_wall1 - g_sync_start_ns),
+			        cpu_clk_ok ? 1 : 0);
+			fclose(cf);
+		}
 	}
 
 	/* Each child writes its own trace fragment; parent merges them.  Written
@@ -356,6 +415,87 @@ static double compute_p95(std::vector<double>& v)
 	size_t idx = (size_t)(0.95 * (double)v.size());
 	if (idx >= v.size()) idx = v.size() - 1;
 	return v[idx];
+}
+
+/* Aggregate the per-task CPU into U, in the units and file format
+ * workloadTasksetBench uses (host_cpu_util_pct, taskset_<mode>_hostcpu.csv), so
+ * a GCAPS number and a seq/stream number are directly comparable.
+ *
+ * Denominator: the LONGEST task window.  Every task shares g_sync_start_ns and
+ * runs while host_ns() < end_ns, so the windows differ only by however far each
+ * task's final period overran the end -- at most one period. */
+static void report_host_cpu(const char* mode_tag)
+{
+	struct Row { char name[48]; unsigned long long cpu, wall; int ok; };
+	Row rows[NUM_TASKS];
+	int  nrows = 0;
+	unsigned long long total_cpu = 0, window = 0;
+
+	for (int i = 0; i < NUM_TASKS; ++i) {
+		char cpath[176];
+		snprintf(cpath, sizeof(cpath),
+		         "results/workloadBench/.cpu_%s_%d.csv", mode_tag, i);
+		FILE* cf = fopen(cpath, "r");
+		if (!cf) continue;
+		int idx = 0, ok = 0;
+		char nm[48] = {0};
+		unsigned long long c = 0, w = 0;
+		if (fscanf(cf, "%d,%47[^,],%llu,%llu,%d", &idx, nm, &c, &w, &ok) == 5) {
+			Row& r = rows[nrows++];
+			snprintf(r.name, sizeof(r.name), "%s", nm);
+			r.cpu = c; r.wall = w; r.ok = ok;
+			if (ok) {
+				total_cpu += c;
+				if (w > window) window = w;
+			}
+		}
+		fclose(cf);
+		remove(cpath);
+	}
+	if (nrows == 0) return;
+
+	const double util = (window > 0)
+	                  ? 100.0 * (double)total_cpu / (double)window : 0.0;
+
+	printf("\n# host_cpu_ns: %llu\n", total_cpu);
+	printf("# host_wall_ns: %llu\n", window);
+	printf("# host_cpu_util_pct: %.4f  (of ONE core; %d task threads, no "
+	       "monitor -- GCAPS schedules in the driver, in each task's own "
+	       "syscall context)\n", util, nrows);
+
+	printf("\nWhole-window host CPU (CLOCK_THREAD_CPUTIME_ID, whole thread)\n");
+	printf("includes each task's emulated C_i spin -- NOT scheduler overhead.\n");
+	printf("EXCLUDES the CUDA driver's per-context helper threads: GCAPS runs one\n");
+	printf("context PER TASK, and that cost is only visible to the process-subtree\n");
+	printf("sampler (scripts/bench/sample_cpu_util.py).\n");
+	printf("%-16s  %8s  %14s\n", "Thread", "cpu(s)", "% of one core");
+	printf("%-16s  %8s  %14s\n", "----------------", "--------",
+	       "--------------");
+
+	char hcPath[176];
+	snprintf(hcPath, sizeof(hcPath),
+	         "results/workloadBench/taskset_%s_hostcpu.csv", mode_tag);
+	FILE* hc = fopen(hcPath, "w");
+	if (hc)
+		fprintf(hc, "thread_name,thread_kind,cpu_ns,window_wall_ns,"
+		            "pct_one_core,clocks_ok\n");
+
+	for (int i = 0; i < nrows; ++i) {
+		const Row& r = rows[i];
+		const double pct = (r.wall > 0)
+		                 ? 100.0 * (double)r.cpu / (double)r.wall : 0.0;
+		printf("%-16s  %8.3f  %13.2f%%\n", r.name,
+		       (double)r.cpu / 1.0e9, pct);
+		if (hc)
+			fprintf(hc, "%s,task,%llu,%llu,%.4f,%d\n",
+			        r.name, r.cpu, r.wall, pct, r.ok);
+	}
+	if (hc) {
+		fprintf(hc, "TOTAL,aggregate,%llu,%llu,%.4f,1\n",
+		        total_cpu, window, util);
+		fclose(hc);
+		printf("\nHost CPU written to %s\n", hcPath);
+	}
 }
 
 static void merge_and_summarise(const char* mode_tag)
@@ -506,6 +646,9 @@ int main(int argc, char** argv)
 		snprintf(path, sizeof(path),
 		         "results/workloadBench/.tsk_%s_%d.csv", mode_tag, i);
 		remove(path);
+		snprintf(path, sizeof(path),
+		         "results/workloadBench/.cpu_%s_%d.csv", mode_tag, i);
+		remove(path);
 	}
 
 	std::vector<pid_t> children;
@@ -536,5 +679,6 @@ int main(int argc, char** argv)
 	if (fd >= 0) close(fd);
 
 	merge_and_summarise(mode_tag);
+	report_host_cpu(mode_tag);
 	return 0;
 }
