@@ -192,6 +192,8 @@ static int gcaps_runlist(int fd, pid_t pid, bool add_req, bool sync_mode)
     return ioctl(fd, NVGPU_GPU_IOCTL_RUNLIST_UPDATE_RT_PRIO, &args);
 }
 
+static int g_pinned_cpu = -1;   /* what actually took effect, for the banner */
+
 static void apply_rt(int pin_cpu)
 {
     struct sched_param sp;
@@ -213,8 +215,10 @@ static void apply_rt(int pin_cpu)
         if (sched_setaffinity(0, sizeof(set), &set) != 0)
             fprintf(stderr, "WARNING: pin to CPU %d failed (errno=%d)\n",
                     pin_cpu, errno);
-        else
+        else {
+            g_pinned_cpu = pin_cpu;
             fprintf(stderr, "  measuring thread pinned to CPU %d\n", pin_cpu);
+        }
     }
 }
 
@@ -492,7 +496,7 @@ int main(int argc, char** argv)
     printf("# rt_applied: %s\n",          realtime ? (rtEarly ? "before_context"
                                                               : "after_context")
                                                    : "none");
-    printf("# pin_cpu: %d\n",             pinCpu);
+    printf("# pin_cpu: %d\n",             g_pinned_cpu);
     printf("# wait_primitive: %s\n",      waitOnEvent ? "cudaEventSynchronize"
                                                       : "cudaStreamSynchronize");
     printf("# blocking_sync: %s\n",       blockingSync ? "yes" : "no");
