@@ -123,13 +123,16 @@ static constexpr uint64_t DEFAULT_RELEASE_PERIOD_US = 997;
  * period is too short for the grid to hold.
  *
  * With -i 0 that is a kernel launch plus the wake: tens of microseconds.  With
- * -i 1 it is DOMINATED by the two GCAPS ioctls, each a full runlist reload with
- * wait_for_finish — MEASURED on the R35.6.4 Orin at p50 295 us and max 436 us
- * per ioctl over 500 solo jobs.  Using the -i 0 figure for both is why a 997 us
- * grid silently degenerated to back-to-back releases (499 of 500 late) with the
- * warning below never firing: 997 > 50 + 40, but the real cycle was ~1263 us. */
+ * -i 1 it is dominated by the two GCAPS ioctls, each a full runlist reload with
+ * wait_for_finish.  Sized from MEASUREMENT, not from adding up the parts: on the
+ * R35.6.4 Orin, 500 solo jobs at exec=50 us gave an inter-release cycle of
+ * p50 1263 us / max 1591 us, i.e. a non-exec part of ~1215 us.  (The two ioctls
+ * are only ~590 us of that at p50 295 us each; the rest is launch, event record
+ * and the wake.  Deriving the guard from the ioctl cost alone put it at 900 and
+ * it STILL did not fire.)  Using the -i 0 figure for both is why a 997 us grid
+ * silently degenerated to back-to-back releases -- 499 of 500 late. */
 static constexpr uint64_t RELEASE_CYCLE_SLACK_US       = 40;
-static constexpr uint64_t RELEASE_CYCLE_SLACK_IOCTL_US = 900;
+static constexpr uint64_t RELEASE_CYCLE_SLACK_IOCTL_US = 1250;
 /* t0 is stamped this far in the FUTURE so job 0 actually sleeps to its grid
  * point instead of finding its deadline already past. */
 static constexpr uint64_t STARTUP_MARGIN_NS         = 10000000ULL;   // 10 ms
