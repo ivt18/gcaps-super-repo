@@ -375,8 +375,7 @@ sudo ./cpuWakeupLatencyGcaps 50 500 -i 1 --realtime > gcaps_w.csv
 its `rt_priority`, so without SCHED_FIFO every ioctl takes the best-effort path.
 RT is applied **after** the CUDA context exists, so the driver's internal
 threads are not spawned by an RT thread and do not inherit SCHED_FIFO — the rule
-`cpuWakeupLatencyBenchSeq` follows. `--rt-early` reproduces the opposite
-ordering (which is what `cpuWakeupLatencyStreamBaseline` currently does).
+`cpuWakeupLatencyBenchSeq` follows.
 
 Drive all three arms together from the thesis repo:
 

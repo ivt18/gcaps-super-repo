@@ -24,26 +24,6 @@
  *   seg_begin_ioctl_ns the GCAPS add ioctl, paid before the kernel runs
  *   seg_end_ioctl_ns   the GCAPS remove ioctl, paid after the wait returns
  *
- * The two ioctl columns are the GCAPS runlist-update overhead (epsilon),
- * measured as host-side wall time around the ioctl() call.
- *
- * The wait primitive is not configurable: GCAPS hard-codes cudaEventSynchronize
- * in gcapsGpuSegEnd, on an event created with cudaEventBlockingSync inside a
- * context created with cudaDeviceScheduleBlockingSync, so W_i here is GCAPS's
- * real wake path.  --spin selects the non-blocking context instead, which is a
- * configuration GCAPS itself supports (its -b flag).
- *
- * RELEASE CADENCE — jobs are released on an absolute grid (t0 + i*period,
- * default 997 µs).
- *
- * REAL-TIME.  -i 1 is the mode that actually exercises GCAPS: it issues the
- * runlist-priority ioctls that elevate this process on the GPU.  The driver
- * decides whether the caller is a real-time task by reading its rt_priority, so
- * in that mode --realtime is effectively mandatory — without SCHED_FIFO every
- * ioctl takes the best-effort path and the run measures nothing.  RT is applied
- * after the CUDA runtime has initialised so the driver's own threads do not
- * inherit it; --rt-early moves it earlier, for testing that effect only.
- *
  * OUTPUT.  One CSV to stdout, or to the file given by --out.  Leading `#` lines
  * record the configuration (device, exec_us, n_jobs, warmup, ioctl_enabled,
  * realtime, pin_cpu, blocking_sync, release_period_us, release_late) and the
@@ -60,8 +40,7 @@
  *   --release-period-us N Absolute release grid period.        (default: 997)
  *   --cpu N               Pin the measuring thread to CPU N.   (default: 2)
  *   --no-pin              Do not pin.
- *   --rt-early            Apply SCHED_FIFO before the first CUDA call.
- *   --spin                Do NOT use blocking sync (GCAPS's default -b 0 mode).
+ *   --spin                Do NOT use blocking sync (GCAPS's default -s 0 mode).
  *   --out FILE            Write the CSV here instead of stdout.  Needed when
  *                         running under run_gcaps_r35.sh, which is MANDATORY
  *                         for -i 1 (it makes SCHED_FIFO attainable despite
@@ -97,24 +76,10 @@ static constexpr int DEFAULT_PIN_CPU = 2;
 
 /* Release cadence. */
 static constexpr uint64_t DEFAULT_RELEASE_PERIOD_US = 997;
-/* Minimum CPU time one job costs the measuring thread outside the segment's own
- * execution.  Used only to warn when the requested release period is too short
- * for the grid to hold; a period below exec_us plus this degenerates into
- * back-to-back releases and shows up as a non-zero release_late count.
- *
- * Two values because the overheads differ by mode:
- *
- *   SLACK_US (-i 0)       kernel launch, event record and the wake: tens of us.
- *   SLACK_IOCTL_US (-i 1) the above plus the two GCAPS runlist-update ioctls,
- *                         one before the kernel and one after the wait returns.
- *                         Each is a full runlist reload with wait_for_finish,
- *                         which the driver busy-polls, so it is CPU time and
- *                         not sleep.
- *
- * The -i 1 figure is MEASURED end to end, not summed from its parts: on the
- * R35.6.4 Orin the observed non-exec cycle is ~1215 us, of which the ioctls are
- * only ~520.  Sizing the guard from the ioctl cost alone left it too low to
- * fire. */
+/* Minimum (approx) CPU time it takes to make a release, without the segment's own
+ * execution.  Only used to warn when the requested release period is too short
+ * to hold the grid.  The -i 1 value is larger because each release then also
+ * pays the two GCAPS runlist-update ioctls. */
 static constexpr uint64_t RELEASE_CYCLE_SLACK_US       = 40;
 static constexpr uint64_t RELEASE_CYCLE_SLACK_IOCTL_US = 1250;
 /* Benchmark start delay after initialisation, so job 0 sleeps to its grid
@@ -131,7 +96,7 @@ static const char* GCAPS_CTRL_DEV = "/dev/nvgpu/igpu0/ctrl";
  * host_ns — read CLOCK_MONOTONIC as a nanosecond timestamp on the host.
  *
  * Intra-CPU use only.  Anything converted into the GPU clock domain must use
- * clock_calib_host_ns() instead — see the two-clock rule in clock_calib.cuh.
+ * clock_calib_host_ns() instead.
  *
  * @return current CLOCK_MONOTONIC value, in nanoseconds
  */
@@ -210,27 +175,22 @@ __global__ void wgcBusyWaitStamp(const uint64_t* durationNs,
     } while (0)
 
 // ============================================================================
-// GCAPS runlist-priority ioctl — the same call sequence as support.h's
-// gcapsGpuSegBegin / gcapsGpuSegEnd, open-coded so the remove ioctl can be
-// timed separately from the wait that precedes it.
+// GCAPS runlist-priority ioctl
 // ============================================================================
 
 /**
- * gcaps_runlist — issue one GCAPS runlist-priority ioctl.
- *
- * The same call support.h's gcapsGpuSegBegin/gcapsGpuSegEnd make, open-coded
- * here so the REMOVE ioctl can be timed separately from the wait that precedes
- * it — W_i deliberately ends before this call, and the ioctl is reported as its
- * own column (epsilon) rather than folded into the wake path.
+ * gcaps_runlist — issue one GCAPS runlist-priority ioctl.  add_req selects
+ * which one: true ADDS this process to the GPU runlist at its real-time
+ * priority (segment begin), false REMOVES it (segment end).
  *
  * The driver decides whether the caller is a real-time task by reading its
  * rt_priority, so this is only meaningful once apply_rt() has succeeded.
  *
  * @param fd        open file descriptor for the nvgpu control device
  * @param pid       process whose TSGs are admitted or evicted
- * @param add_req   true to admit (segment begin), false to remove (segment end)
- * @param sync_mode driver-side path selector; UNRELATED to the CPU-side wait
- *                  primitive despite the name
+ * @param add_req   true to add to the runlist (segment begin), false to remove
+ *                  from it (segment end)
+ * @param sync_mode driver-side path selector (true enforces GPU mutual exclusion)
  * @return the ioctl return value: >= 0 on success, < 0 with errno set
  */
 static int gcaps_runlist(int fd, pid_t pid, bool add_req, bool sync_mode)
@@ -247,14 +207,6 @@ static int g_pinned_cpu = -1;   /* what actually took effect, for the banner */
 
 /**
  * apply_rt — put the measuring thread on SCHED_FIFO and optionally pin it.
- *
- * Both steps are best-effort and warn rather than abort, but a failed
- * sched_setscheduler INVALIDATES a `-i 1` run: the driver reads rt_priority to
- * decide whether the caller is a real-time task at all, so every ioctl would
- * silently take the best-effort branch.  On this kernel
- * (CONFIG_RT_GROUP_SCHED=y) it fails even under sudo unless the caller has been
- * moved into a cgroup with a non-zero cpu.rt_runtime_us, which is why
- * run_gcaps_r35.sh is mandatory.
  *
  * Records the pin that actually took effect in g_pinned_cpu, so the banner and
  * the CSV report what happened rather than what was requested.
@@ -296,18 +248,6 @@ static void apply_rt(int pin_cpu)
 /**
  * main — run the W_i sweep and write the per-release CSV.
  *
- * Sequence: parse options, apply RT (optionally before context creation via
- * --rt-early), open the GCAPS device, take the start calibration bracket with
- * the GPU idle, run `warmup` throwaway releases, then release n_jobs on an
- * absolute grid.  Each release is add ioctl -> segment kernel ->
- * cudaEventSynchronize -> RAW wakeup stamp -> remove ioctl, so the stamp lands
- * before any GCAPS bookkeeping.  Finally the end bracket closes and W_i is
- * computed in a post-run pass with the drift-corrected offset.
- *
- * The end-of-run calibration must itself be wrapped in a GCAPS add/remove
- * bracket: unbracketed GPU work after the last remove ioctl never completes,
- * because the process holds no runlist entry to run it on.
- *
  * @param argc argument count
  * @param argv see the usage block at the top of this file
  * @return EXIT_SUCCESS, or EXIT_FAILURE on a bad option or a CUDA/ioctl failure
@@ -319,7 +259,6 @@ int main(int argc, char** argv)
     int      warmup          = 10;
     int      ioctlEnabled    = 1;
     bool     realtime        = false;
-    bool     rtEarly         = false;
     bool     blockingSync    = true;
     int      pinCpu          = DEFAULT_PIN_CPU;
     uint64_t releasePeriodUs = DEFAULT_RELEASE_PERIOD_US;
@@ -330,7 +269,6 @@ int main(int argc, char** argv)
     std::vector<const char*> pos;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--realtime") == 0)            realtime = true;
-        else if (strcmp(argv[i], "--rt-early") == 0)       rtEarly = true;
         else if (strcmp(argv[i], "--spin") == 0)           blockingSync = false;
         else if (strcmp(argv[i], "--no-pin") == 0)         pinCpu = -1;
         else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc)
@@ -354,11 +292,10 @@ int main(int argc, char** argv)
         fprintf(stderr, "--release-period-us must be >= 1\n");
         return EXIT_FAILURE;
     }
-    /* OVERLAP.  One segment in flight at a time: the next grid point must not
-     * be due before the current job's remove ioctl has returned, or the grid
-     * degenerates to back-to-back releases (every sleep expires in the past)
-     * and W_i is measured at one fixed phase of whatever periodic activity the
-     * driver has, instead of over a uniform sweep of it. */
+    /* The period must outlast a whole job, because if the next release is
+     * already due when one finishes, every release runs back-to-back and each
+     * W_i lands at the same point in the driver's periodic work instead of
+     * sampling across all of it. */
     const uint64_t cycleSlackUs = ioctlEnabled ? RELEASE_CYCLE_SLACK_IOCTL_US
                                                : RELEASE_CYCLE_SLACK_US;
     if (releasePeriodUs <= execUs + cycleSlackUs)
@@ -379,11 +316,9 @@ int main(int argc, char** argv)
                 "by rt_priority, so every ioctl will take the best-effort path "
                 "and W_i will not describe GCAPS's real-time wake path.\n");
 
-    // ---- Blocking sync MUST be requested before the context exists ---------
-    // Runtime-API equivalent of the driver-API CU_CTX_SCHED_BLOCKING_SYNC that
-    // SeqWorkload::taskInit() uses in suspend mode (-b 1), and the same call
-    // cpuWakeupLatencyStreamBaseline makes.  Without it the wait spin-polls and
-    // W_i measures a spin loop rather than an OS wake-up.
+    // Must be set before the context is created: it makes the segment-end wait
+    // sleep until the GPU interrupt arrives instead of spin-polling, which is
+    // what makes W_i an OS wake-up rather than the cost of a spin loop.
     if (blockingSync)
         CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
 
@@ -397,8 +332,7 @@ int main(int argc, char** argv)
     fprintf(stderr, "  warmup       : %d\n",   warmup);
     fprintf(stderr, "  ioctl        : %s\n",   ioctlEnabled ? "on (GCAPS)"
                                                             : "off (TSG baseline)");
-    fprintf(stderr, "  realtime     : %s%s\n", realtime ? "yes" : "no",
-            rtEarly ? " (applied before context creation)" : "");
+    fprintf(stderr, "  realtime     : %s\n",   realtime ? "yes" : "no");
     fprintf(stderr, "  wait         : cudaEventSynchronize (GCAPS's own)\n");
     fprintf(stderr, "  blocking sync: %s\n",   blockingSync ? "yes" : "no (spin)");
     fflush(stderr);
@@ -413,11 +347,6 @@ int main(int argc, char** argv)
             return EXIT_FAILURE;
         }
     }
-
-    /* --rt-early: switch to SCHED_FIFO BEFORE any cuda* call, i.e. before the
-     * driver spawns its worker threads.  That is the ordering under which they
-     * would inherit RT (PTHREAD_INHERIT_SCHED).  Testing aid; see the header. */
-    if (realtime && rtEarly) apply_rt(pinCpu);
 
     // ---- Device-side duration and per-job completion slots -----------------
     const uint64_t durNs = execUs * 1000ULL;
@@ -448,9 +377,9 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaEventCreateWithFlags(&evStart, evFlags));
     CUDA_CHECK(cudaEventCreateWithFlags(&evStop,  evFlags));
 
-    /* Default: RT after the runtime is up, so the driver's worker threads were
-     * created at default priority.  Matches the seq arm's rule. */
-    if (realtime && !rtEarly) apply_rt(pinCpu);
+    /* RT goes on after the runtime is up, so the driver's worker threads were
+     * created at default priority and do not inherit it. */
+    if (realtime) apply_rt(pinCpu);
 
     const pid_t myPid = getpid();
 
@@ -601,9 +530,6 @@ int main(int argc, char** argv)
     printf("# warmup: %d\n",              warmup);
     printf("# ioctl_enabled: %d\n",       ioctlEnabled);
     printf("# realtime: %s\n",            realtime ? "yes" : "no");
-    printf("# rt_applied: %s\n",          realtime ? (rtEarly ? "before_context"
-                                                              : "after_context")
-                                                   : "none");
     printf("# pin_cpu: %d\n",             g_pinned_cpu);
     printf("# wait_primitive: cudaEventSynchronize\n");
     printf("# blocking_sync: %s\n",       blockingSync ? "yes" : "no");
