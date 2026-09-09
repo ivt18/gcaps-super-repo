@@ -101,11 +101,11 @@ workloads as the per-period GPU segments, one forked process per task. Writes
 `results/workloadBench/taskset_{gcaps,tsg}_{trace,results}.csv`. Real-time
 tasks need `sudo` for SCHED_FIFO.
 ```bash
-sudo ./workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S] [-k N] [-S SCALE]
+sudo ./workloadTasksetGcaps [-i 0|1] [-b 0|1] [-d DURATION_S] [-k N] [-S SCALE]
 # defaults: -i 0 -s 0 -b 0 -d 30 -S 1.0, all GPU tasks
-sudo ./workloadTasksetGcaps -i 1 -s 1 -d 30          # GCAPS (all 6 GPU tasks)
-sudo ./workloadTasksetGcaps -i 0 -s 1 -d 30          # TSG baseline
-sudo ./workloadTasksetGcaps -i 1 -s 1 -d 15 -S 0.5   # GCAPS at ~2x GPU utilization
+sudo ./workloadTasksetGcaps -i 1 -d 30               # GCAPS (all 6 GPU tasks)
+sudo ./workloadTasksetGcaps -i 0 -d 30               # TSG baseline
+sudo ./workloadTasksetGcaps -i 1 -d 15 -S 0.5        # GCAPS at ~2x GPU utilization
 ```
 `-k N` activates only the first N GPU tasks (the CPU-only task always runs);
 useful for diagnostics/bisection, not normally needed.
@@ -187,7 +187,7 @@ those fall back to the single overhead band and `epsilon.pdf` is skipped.
   `sudo chown -R $USER:$USER results`.
 - **`cudaErrorLaunchTimeout` / spinning in `taskInit`.** The simultaneous
   context-init storm — fixed by the staggered start-up; make sure you rebuilt
-  (`make clean && make workloadTasksetGcaps`) and are on `-s 1`.
+  (`make clean && make workloadTasksetGcaps`).
 - **Power mode.** Mode numbers are board-specific; use `-m 0` (MAXN) on Orin for
   all cores + max clocks. Copying another board's mode number (e.g. `-m 2`) can
   silently select a reduced-core/low-clock profile.

@@ -62,9 +62,9 @@
  * invalidates the run.  Warm-up (formerly a side effect of verify) is now
  * explicit: -w N runs each task's segment N times during its init slot.
  *
- * Usage:  workloadTasksetGcaps [-i 0|1] [-s 0|1] [-b 0|1] [-d DURATION_S]
+ * Usage:  workloadTasksetGcaps [-i 0|1] [-b 0|1] [-d DURATION_S]
  *                              [-k N] [-S SCALE] [-w WARMUP]
- *         (defaults: -i 0 -s 0 -b 0 -d 30 -S 1.0 -w 1, all GPU tasks)
+ *         (defaults: -i 0 -b 0 -d 30 -S 1.0 -w 1, all GPU tasks)
  *         -k N : activate only the first N GPU tasks (CPU-only task always
  *                runs) — for bisecting how many concurrent GPU contexts the
  *                GCAPS elevation path tolerates before deadlocking.
@@ -261,7 +261,7 @@ static inline uint64_t thread_cpu_ns(bool* ok)
 }
 
 static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
-                     bool suspension, const char* mode_tag)
+                     const char* mode_tag)
 {
 	const BenchTaskDef& td = TASKS[task_idx];
 
@@ -290,8 +290,12 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 
 	SeqWorkload* wl = nullptr;
 	if (td.is_gpu) {
+		/* Waits always block rather than spin: this arm evaluates only the
+		 * blocking variant, matching the stream baseline it is compared
+		 * against.  SeqWorkload keeps the parameter for the other GCAPS
+		 * binaries, which still expose it. */
 		wl = new SeqWorkload(td.wlType, td.wlP1, td.wlP2, fd, sync_mode,
-		                     ioctl_enabled, suspension);
+		                     ioctl_enabled, /*suspension=*/true);
 		wl->taskInit();
 		/* Warm-up only — verification is deferred to after the measurement
 		 * window (see post-run verify below), so a slow host reference
@@ -666,14 +670,13 @@ int main(int argc, char** argv)
 {
 	setvbuf(stdout, nullptr, _IONBF, 0);
 
-	int ioctl_enabled = 0, suspension = 0, sync_mode = 0;
+	int ioctl_enabled = 0, sync_mode = 0;
 	uint64_t duration_s = 30;
 	int gpu_limit = -1;   /* -1 = all GPU tasks; else activate only first N */
 	int opt;
-	while ((opt = getopt(argc, argv, "i:s:b:d:k:S:w:W")) != EOF) {
+	while ((opt = getopt(argc, argv, "i:b:d:k:S:w:W")) != EOF) {
 		switch (opt) {
 			case 'i': ioctl_enabled = atoi(optarg); break;
-			case 's': suspension    = atoi(optarg); break;
 			case 'b': sync_mode     = atoi(optarg); break;
 			case 'd': duration_s    = strtoull(optarg, nullptr, 10); break;
 			case 'k': gpu_limit     = atoi(optarg); break;
@@ -752,7 +755,7 @@ int main(int argc, char** argv)
 		pid_t pid = fork();
 		if (pid == 0) {
 			run_task(i, fd, (bool)sync_mode, (bool)ioctl_enabled,
-			         (bool)suspension, mode_tag);
+			         mode_tag);
 			if (fd >= 0) close(fd);
 			_exit(0);
 		} else if (pid > 0) {

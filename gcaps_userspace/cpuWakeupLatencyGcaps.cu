@@ -40,7 +40,6 @@
  *   --release-period-us N Absolute release grid period.        (default: 997)
  *   --cpu N               Pin the measuring thread to CPU N.   (default: 2)
  *   --no-pin              Do not pin.
- *   --spin                Do NOT use blocking sync (GCAPS's default -s 0 mode).
  *   --out FILE            Write the CSV here instead of stdout.  Needed when
  *                         running under run_gcaps_r35.sh, which is MANDATORY
  *                         for -i 1 (it makes SCHED_FIFO attainable despite
@@ -259,7 +258,6 @@ int main(int argc, char** argv)
     int      warmup          = 10;
     int      ioctlEnabled    = 1;
     bool     realtime        = false;
-    bool     blockingSync    = true;
     int      pinCpu          = DEFAULT_PIN_CPU;
     uint64_t releasePeriodUs = DEFAULT_RELEASE_PERIOD_US;
     const char* outPath      = nullptr;
@@ -269,7 +267,6 @@ int main(int argc, char** argv)
     std::vector<const char*> pos;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--realtime") == 0)            realtime = true;
-        else if (strcmp(argv[i], "--spin") == 0)           blockingSync = false;
         else if (strcmp(argv[i], "--no-pin") == 0)         pinCpu = -1;
         else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc)
             ioctlEnabled = atoi(argv[++i]);
@@ -319,8 +316,7 @@ int main(int argc, char** argv)
     // Must be set before the context is created: it makes the segment-end wait
     // sleep until the GPU interrupt arrives instead of spin-polling, which is
     // what makes W_i an OS wake-up rather than the cost of a spin loop.
-    if (blockingSync)
-        CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+    CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
@@ -334,7 +330,7 @@ int main(int argc, char** argv)
                                                             : "off (TSG baseline)");
     fprintf(stderr, "  realtime     : %s\n",   realtime ? "yes" : "no");
     fprintf(stderr, "  wait         : cudaEventSynchronize (GCAPS's own)\n");
-    fprintf(stderr, "  blocking sync: %s\n",   blockingSync ? "yes" : "no (spin)");
+    fprintf(stderr, "  blocking sync: yes\n");
     fflush(stderr);
 
     // ---- GCAPS control device ---------------------------------------------
@@ -371,8 +367,7 @@ int main(int argc, char** argv)
     /* The segment bracket's events, with GCAPS's own flags: blocking sync so
      * cudaEventSynchronize sleeps, timing disabled otherwise (the native GCAPS
      * apps' convention — W_i never uses cudaEventElapsedTime). */
-    unsigned evFlags = blockingSync ? cudaEventBlockingSync
-                                    : cudaEventDisableTiming;
+    unsigned evFlags = cudaEventBlockingSync;
     cudaEvent_t evStart = nullptr, evStop = nullptr;
     CUDA_CHECK(cudaEventCreateWithFlags(&evStart, evFlags));
     CUDA_CHECK(cudaEventCreateWithFlags(&evStop,  evFlags));
@@ -532,7 +527,7 @@ int main(int argc, char** argv)
     printf("# realtime: %s\n",            realtime ? "yes" : "no");
     printf("# pin_cpu: %d\n",             g_pinned_cpu);
     printf("# wait_primitive: cudaEventSynchronize\n");
-    printf("# blocking_sync: %s\n",       blockingSync ? "yes" : "no");
+    printf("# blocking_sync: yes\n");
     printf("# release_period_us: %llu\n", (unsigned long long)releasePeriodUs);
     printf("# release_late: %d  (grid points already past; want 0)\n", late);
     clock_bracket_report(&clk);
