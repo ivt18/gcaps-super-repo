@@ -1,78 +1,55 @@
 /**
  * ============================================================================
- * cpuWakeupLatencyGcaps.cu  — EQ 2.2, GCAPS arm
+ * cpuWakeupLatencyGcaps.cu
  * ============================================================================
  *
- * GCAPS counterpart to singleTaskSched's cpuWakeupLatencyBenchSeq (Sequence-
- * Scheduler) and cpuWakeupLatencyStreamBaseline (plain stream).  Measures how
- * long after the GPU segment finishes the waiting CPU thread is unblocked.
+ * Measures how long after the GPU segment finishes the waiting CPU thread is
+ * unblocked.
  *
  *   W_i = (wakeup_cpu_ns + cpu_to_gpu_offset_ns) − completion_gpu_ns
  *
- *   completion_gpu_ns — %globaltimer written by the SEGMENT KERNEL's own last
- *                       instruction into a pinned slot.  Identical kernel and
- *                       identical stamp point to both sibling binaries.
+ *   completion_gpu_ns — %globaltimer written by the kernel's own last
+ *                       instruction into a pinned slot.
  *   wakeup_cpu_ns     — CLOCK_MONOTONIC captured immediately after the GCAPS
- *                       segment-end wait returns, BEFORE the remove ioctl.
+ *                       segment-end wait returns, before the remove ioctl.
  *
- * WHY BEFORE THE REMOVE IOCTL.  This is the counterpart of the seq binary's
- * "not ReleaseStatistics::completionTime" decision.  `gcapsGpuSegEnd` is
+ * The wakeup stamp is taken before the remove ioctl: the thread is running
+ * again the moment the wait returns, and the ioctl that follows is GCAPS
+ * bookkeeping rather than part of the wake path.  That ioctl is reported in its
+ * own column instead.
  *
- *     cudaEventRecord(stop, stream); cudaEventSynchronize(stop); ioctl(remove);
+ * Per-job values, all in nanoseconds:
  *
- * The thread is *running again* the moment cudaEventSynchronize returns; the
- * remove ioctl that follows is GCAPS's runlist bookkeeping, not part of the
- * wake path.  Folding it into W_i would compare seq's wake path against
- * GCAPS's wake path *plus* a runlist reload, and the reload is already
- * measured properly elsewhere (the driver's own GCAPS_EV elapsed_us, and
- * scripts/measure_preempt_overhead.py).  It is reported here as a separate
- * column instead, mirroring how seq splits W into detect_ns + notify_ns:
+ *   W_ns               W_i for that job, i.e. the formula above
+ *   seg_begin_ioctl_ns the GCAPS add ioctl, paid before the kernel runs
+ *   seg_end_ioctl_ns   the GCAPS remove ioctl, paid after the wait returns
  *
- *   W_ns                = wakeup − T_seg        (comparable across all arms)
- *   seg_end_ioctl_ns    = the remove ioctl      (GCAPS ε, wall, host-side)
- *   seg_begin_ioctl_ns  = the add ioctl         (paid before the kernel runs)
+ * The two ioctl columns are the GCAPS runlist-update overhead (epsilon),
+ * measured as host-side wall time around the ioctl() call.
  *
- * THE WAIT PRIMITIVE is GCAPS's own and is NOT configurable here —
- * cudaEventSynchronize on the segment's `stop` event, created with
- * cudaEventBlockingSync, inside a context created with
- * cudaDeviceScheduleBlockingSync.  That is exactly what `gcapsGpuSegEnd` plus
- * SeqWorkload's suspend mode (-b 1) do, so W_i is GCAPS's real wake path and
- * not an approximation of it.  There is deliberately no switch for this: GCAPS
- * hard-codes cudaEventSynchronize in `gcapsGpuSegEnd`, so a stream-sync variant
- * would measure a configuration GCAPS cannot be run in.  The stream BASELINE
- * blocks in cudaStreamSynchronize because that is what a plain-streams program
- * does; that difference belongs to the arms being compared, not to a knob
- * inside this one.
+ * The wait primitive is not configurable: GCAPS hard-codes cudaEventSynchronize
+ * in gcapsGpuSegEnd, on an event created with cudaEventBlockingSync inside a
+ * context created with cudaDeviceScheduleBlockingSync, so W_i here is GCAPS's
+ * real wake path.  --spin selects the non-blocking context instead, which is a
+ * configuration GCAPS itself supports (its -b flag).
  *
- * RELEASE CADENCE — jobs are released on an ABSOLUTE grid (t0 + i*period,
- * default 997 µs), matching both sibling binaries.  GCAPS has no monitor to
- * de-phase, so the co-primality argument in the seq header does not apply
- * here; the grid is kept anyway because EQ 2.2 is a head-to-head and an
- * unequal release rate or GPU duty cycle would leave a W_i difference
- * attributable to something other than the wake path.
+ * RELEASE CADENCE — jobs are released on an absolute grid (t0 + i*period,
+ * default 997 µs).
  *
- * REAL-TIME.  `--realtime` is effectively MANDATORY for -i 1: the driver reads
- * the caller's rt_priority to decide whether it is a real-time task at all, so
- * without SCHED_FIFO the ioctl runs the best-effort path and measures nothing.
+ * REAL-TIME.  -i 1 is the mode that actually exercises GCAPS: it issues the
+ * runlist-priority ioctls that elevate this process on the GPU.  The driver
+ * decides whether the caller is a real-time task by reading its rt_priority, so
+ * in that mode --realtime is effectively mandatory — without SCHED_FIFO every
+ * ioctl takes the best-effort path and the run measures nothing.  RT is applied
+ * after the CUDA runtime has initialised so the driver's own threads do not
+ * inherit it; --rt-early moves it earlier, for testing that effect only.
  *
- * RT is applied AFTER the CUDA runtime has been initialised, which is the rule
- * cpuWakeupLatencyBenchSeq states ("applied AFTER start() so CUDA's internal
- * threads do not inherit RT") — pthread_create defaults to
- * PTHREAD_INHERIT_SCHED, so a driver thread spawned by an RT thread would come
- * up SCHED_FIFO too.  MEASURED (CUDA 13.3, desktop driver): all four driver
- * worker threads appear at the FIRST cuda* runtime call and none afterwards,
- * including across hundreds of launch/event-sync cycles — so on that stack the
- * ordering is moot and cpuWakeupLatencyStreamBaseline, which switches to
- * SCHED_FIFO after its own first runtime call (cudaSetDeviceFlags), is equally
- * safe.  The ordering is kept because it costs nothing and makes the property
- * hold by construction rather than by driver version; re-check with
- * /proc/self/task if the CUDA version changes.  `--rt-early` moves the switch
- * ahead of the first runtime call, which is the one ordering that WOULD leak
- * RT into the driver's threads — for testing that, nothing else.
+ * OUTPUT.  One CSV to stdout, or to the file given by --out.  Leading `#` lines
+ * record the configuration (device, exec_us, n_jobs, warmup, ioctl_enabled,
+ * realtime, pin_cpu, blocking_sync, release_period_us, release_late) and the
+ * clock calibration.  Then a header row and one row per completed job:
  *
- * Output columns are a superset of cpuWakeupLatencyStreamBaseline's shared set
- * (job_id,completion_ns,wakeup_ns,W_ns) so run_cpu_wakeup_latency.py can drive
- * this binary as a third arm.
+ *   job_id,completion_ns,wakeup_ns,W_ns,seg_begin_ioctl_ns,seg_end_ioctl_ns
  *
  * Usage: cpuWakeupLatencyGcaps [EXEC_US [N_JOBS]] [options]
  *   EXEC_US               Segment execution time in µs.        (default: 50)
@@ -115,26 +92,32 @@
 
 /* Same band as the sibling binaries: the measuring thread runs at 50. */
 static constexpr int RT_PRIORITY = 50;
-/* cpuWakeupLatencyBenchSeq's RELEASE_CPU — the thread whose wake-up is timed. */
+/* cpuWakeupLatencyBenchSeq's RELEASE_CPU: the thread whose wake-up is timed. */
 static constexpr int DEFAULT_PIN_CPU = 2;
 
-/* Release cadence — MUST MATCH the sibling binaries. */
+/* Release cadence. */
 static constexpr uint64_t DEFAULT_RELEASE_PERIOD_US = 997;
-/* Non-exec part of a job cycle — used only to warn when the requested release
- * period is too short for the grid to hold.
+/* Minimum CPU time one job costs the measuring thread outside the segment's own
+ * execution.  Used only to warn when the requested release period is too short
+ * for the grid to hold; a period below exec_us plus this degenerates into
+ * back-to-back releases and shows up as a non-zero release_late count.
  *
- * With -i 0 that is a kernel launch plus the wake: tens of microseconds.  With
- * -i 1 it is dominated by the two GCAPS ioctls, each a full runlist reload with
- * wait_for_finish.  Sized from MEASUREMENT, not from adding up the parts: on the
- * R35.6.4 Orin, 500 solo jobs at exec=50 us gave an inter-release cycle of
- * p50 1263 us / max 1591 us, i.e. a non-exec part of ~1215 us.  (The two ioctls
- * are only ~590 us of that at p50 295 us each; the rest is launch, event record
- * and the wake.  Deriving the guard from the ioctl cost alone put it at 900 and
- * it STILL did not fire.)  Using the -i 0 figure for both is why a 997 us grid
- * silently degenerated to back-to-back releases -- 499 of 500 late. */
+ * Two values because the overheads differ by mode:
+ *
+ *   SLACK_US (-i 0)       kernel launch, event record and the wake: tens of us.
+ *   SLACK_IOCTL_US (-i 1) the above plus the two GCAPS runlist-update ioctls,
+ *                         one before the kernel and one after the wait returns.
+ *                         Each is a full runlist reload with wait_for_finish,
+ *                         which the driver busy-polls, so it is CPU time and
+ *                         not sleep.
+ *
+ * The -i 1 figure is MEASURED end to end, not summed from its parts: on the
+ * R35.6.4 Orin the observed non-exec cycle is ~1215 us, of which the ioctls are
+ * only ~520.  Sizing the guard from the ioctl cost alone left it too low to
+ * fire. */
 static constexpr uint64_t RELEASE_CYCLE_SLACK_US       = 40;
 static constexpr uint64_t RELEASE_CYCLE_SLACK_IOCTL_US = 1250;
-/* t0 is stamped this far in the FUTURE so job 0 actually sleeps to its grid
+/* Benchmark start delay after initialisation, so job 0 sleeps to its grid
  * point instead of finding its deadline already past. */
 static constexpr uint64_t STARTUP_MARGIN_NS         = 10000000ULL;   // 10 ms
 
@@ -145,19 +128,10 @@ static const char* GCAPS_CTRL_DEV = "/dev/nvgpu/igpu0/ctrl";
 // ============================================================================
 
 /**
- * host_ns — read CLOCK_MONOTONIC as a nanosecond timestamp.
+ * host_ns — read CLOCK_MONOTONIC as a nanosecond timestamp on the host.
  *
- * INTRA-CPU ONLY.  Drives the absolute release grid (sleep_until_ns), the
- * release_late check and the two ioctl durations — all of which are either
- * deadlines the kernel must accept or differences between two stamps on this
- * same clock.
- *
- * NOT for anything converted into the GPU %globaltimer domain: CLOCK_MONOTONIC
- * is frequency-slewed by NTP, and the slew RATE changes during a run, which
- * curves the CPU->GPU offset trajectory that clock_calib.cuh interpolates
- * linearly.  Cross-clock stamps use clock_calib_host_ns() (CLOCK_MONOTONIC_RAW)
- * instead.  The two clocks diverge by the accumulated slew since boot, so they
- * must never be subtracted from one another.
+ * Intra-CPU use only.  Anything converted into the GPU clock domain must use
+ * clock_calib_host_ns() instead — see the two-clock rule in clock_calib.cuh.
  *
  * @return current CLOCK_MONOTONIC value, in nanoseconds
  */
@@ -169,12 +143,7 @@ static inline uint64_t host_ns()
 }
 
 /**
- * sleep_until_ns — block until an ABSOLUTE CLOCK_MONOTONIC deadline.
- *
- * Absolute rather than relative so the release grid cannot drift: a late wake
- * eats into the next period instead of pushing every subsequent release back.
- * EINTR retries the UNCHANGED deadline, so a signal resumes the cadence rather
- * than extending it.
+ * sleep_until_ns — block on a host thread until an absolute CLOCK_MONOTONIC deadline.
  *
  * A deadline already in the past returns immediately; the caller counts those
  * as release_late, which must read 0 for the sweep to be on its intended grid.
@@ -189,17 +158,10 @@ static void sleep_until_ns(uint64_t target_ns)
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) != 0) {}
 }
 
-// ============================================================================
-// Segment kernel — byte-for-byte the sibling binaries' busy-wait + stamp, so
-// the completion instant means the same thing in all three arms.
-// ============================================================================
-
 /**
- * wgc_gpu_ns — read the GPU's %globaltimer as a nanosecond timestamp.
+ * wgc_gpu_ns — kernel to read the GPU's %globaltimer as a nanosecond timestamp.
  *
- * Device-side counterpart of host_ns().  %globaltimer is the clock W_i's
- * completion endpoint is expressed in, and it free-runs independently of the
- * CPU clocks, hence the calibration bracket.
+ * Device-side counterpart of host_ns().
  *
  * @return current %globaltimer value, in nanoseconds
  */
@@ -213,14 +175,7 @@ static __device__ __forceinline__ uint64_t wgc_gpu_ns()
 /**
  * wgcBusyWaitStamp — the measured GPU segment: busy-wait, then stamp completion.
  *
- * Byte-for-byte the kernel cpuWakeupLatencyBenchSeq and
- * cpuWakeupLatencyStreamBaseline run, so the completion instant means the same
- * thing in all three EQ 2.2 arms and W_i is comparable across them.
- *
- * The completion stamp is taken by the kernel's OWN LAST INSTRUCTION, which is
- * what makes W_i independent of how long the segment ran: everything measured
- * afterwards is wake path, not execution.  Single-threaded (thread 0 only) so
- * the stamp is unambiguous.
+ * The completion stamp is taken by the kernel's own last instruction.
  *
  * @param durationNs    device pointer to the busy-wait length, in ns
  *                      (0 is valid and yields a stamp-only segment)
@@ -240,9 +195,7 @@ __global__ void wgcBusyWaitStamp(const uint64_t* durationNs,
 /**
  * CUDA_CHECK — abort the enclosing function with EXIT_FAILURE on a CUDA error.
  *
- * Reports file, line and the runtime's own message.  Because it returns
- * EXIT_FAILURE it is only usable from a function whose return type is int
- * (in practice: main).
+ * Reports file, line and the runtime's own message.
  *
  * @param call a CUDA runtime call returning cudaError_t
  */
