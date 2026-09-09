@@ -21,7 +21,7 @@
  *
  * The eval/bench binaries that report a metric spanning the CPU and GPU clocks
  * (response, scheduling overhead O_i, wakeup latency W_i, …) convert a CPU
- * CLOCK_MONOTONIC timestamp into the GPU %globaltimer domain via an offset:
+ * CLOCK_MONOTONIC_RAW timestamp into the GPU %globaltimer domain via an offset:
  *
  *     gpu_ns ≈ cpu_ns + offset
  *
@@ -30,6 +30,39 @@
  * This header provides a two-point calibration bracket (start + end of run) and
  * a linearly interpolated offset_at(t) so each sample is converted with the
  * offset that was valid at its own wall-clock time — removing the drift.
+ *
+ * ===========================================================================
+ * WHY CLOCK_MONOTONIC_RAW, AND THE TWO-CLOCK RULE
+ * ===========================================================================
+ * CLOCK_MONOTONIC is frequency-slewed by NTP.  The slew is a control loop, so
+ * its rate CHANGES during a run: the CPU↔GPU offset trajectory is then curved,
+ * and the linear interpolation between the two bracket points is wrong in the
+ * MIDDLE of the run while remaining correct at both ends.  Measured on the
+ * R35 Orin with systemd-timesyncd active (2026-09-08): a −94.8 ppm slew turned
+ * a 30 s wakeup-latency run into a symmetric parabola of error, +2.1 µs at
+ * job 0, −20.9 µs at job 5000, +0.9 µs at job 9999 — i.e. NEGATIVE wakeup
+ * latencies, which are physically impossible.  At a quiet ±12 ppm the same
+ * curvature contributes only ~1–2 µs and hides.
+ *
+ * CLOCK_MONOTONIC_RAW is never NTP-adjusted, so what remains is genuine
+ * oscillator drift.  That is not guaranteed linear either (it is thermal and
+ * age dependent), but it removes the one term that was actively bending the
+ * curve within a single run.
+ *
+ * THE RULE, because the two clocks cannot be interchanged freely:
+ *
+ *   CROSS-CLOCK stamps — anything converted with offset_at() and compared
+ *       against a GPU %globaltimer value — MUST use clock_calib_host_ns()
+ *       (CLOCK_MONOTONIC_RAW).  Mixing clocks here reintroduces the slew.
+ *
+ *   RELEASE GRIDS, TIMEOUTS AND CV WAITS must stay on CLOCK_MONOTONIC.  The
+ *       kernel does not accept RAW for either: clock_nanosleep() returns
+ *       ENOTSUP (95) and pthread_condattr_setclock() returns EINVAL (22).
+ *
+ * A binary that needs the same instant on both axes takes both stamps; a vDSO
+ * read is ~25 ns, so the second one is free.  The two axes diverge by the slew
+ * (~95 ppm ⇒ ~2.8 ms over a 30 s run), which is negligible within one period
+ * but NOT across a whole run — never subtract one from the other.
  *
  * Usage (bench-owned bracket; the scheduler's internal offset is not used):
  *     uint64_t* h_gpuTs; cudaMallocHost(&h_gpuTs, sizeof(uint64_t));
@@ -68,12 +101,15 @@
 #define CALIB_N_SAMPLES 64
 #endif
 
-/* Internal host monotonic clock — named to avoid colliding with callers'
- * own host_ns()/host_nanoseconds() helpers. */
+/* THE cross-clock host stamp.  Named to avoid colliding with callers' own
+ * host_ns()/host_nanoseconds() helpers — but callers must route every stamp
+ * they convert with offset_at() through THIS function (or an identical RAW
+ * read), or the offset is applied to a clock it was not measured against.
+ * See "THE TWO-CLOCK RULE" above: RAW here, CLOCK_MONOTONIC for grids/CVs. */
 static inline uint64_t clock_calib_host_ns()
 {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
@@ -128,7 +164,7 @@ static inline int clock_calibrate(cudaStream_t stream, uint64_t* h_gpuTs,
 /* A start/end calibration bracket for linear drift correction over a run. */
 struct ClockBracket {
     int64_t  offset_start = 0, offset_end = 0;
-    uint64_t t_start = 0, t_end = 0;     /* CLOCK_MONOTONIC ns at each bracket */
+    uint64_t t_start = 0, t_end = 0;     /* CLOCK_MONOTONIC_RAW ns per bracket */
     double   std_start = 0.0, std_end = 0.0;
     bool     have_start = false, have_end = false;
 

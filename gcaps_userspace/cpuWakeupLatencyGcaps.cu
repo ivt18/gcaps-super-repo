@@ -447,7 +447,9 @@ int main(int argc, char** argv)
         /* --- gcapsGpuSegEnd: event record, THE WAIT, then the remove ioctl -- */
         cudaEventRecord(evStop, stream);
         const cudaError_t syncErr = cudaEventSynchronize(evStop);
-        wakeupTimes[(size_t)i] = host_ns();
+        wakeupTimes[(size_t)i] = clock_calib_host_ns()  /* CLOCK_MONOTONIC_RAW: this stamp is
+                                       * converted with offset_at(); see the
+                                       * two-clock rule in clock_calib.cuh */;
 
         if (syncErr != cudaSuccess) {
             fprintf(stderr, "segment wait failed (job %d): %s\n",
