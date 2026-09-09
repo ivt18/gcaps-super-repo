@@ -144,6 +144,23 @@ static const char* GCAPS_CTRL_DEV = "/dev/nvgpu/igpu0/ctrl";
 // Clocks
 // ============================================================================
 
+/**
+ * host_ns — read CLOCK_MONOTONIC as a nanosecond timestamp.
+ *
+ * INTRA-CPU ONLY.  Drives the absolute release grid (sleep_until_ns), the
+ * release_late check and the two ioctl durations — all of which are either
+ * deadlines the kernel must accept or differences between two stamps on this
+ * same clock.
+ *
+ * NOT for anything converted into the GPU %globaltimer domain: CLOCK_MONOTONIC
+ * is frequency-slewed by NTP, and the slew RATE changes during a run, which
+ * curves the CPU->GPU offset trajectory that clock_calib.cuh interpolates
+ * linearly.  Cross-clock stamps use clock_calib_host_ns() (CLOCK_MONOTONIC_RAW)
+ * instead.  The two clocks diverge by the accumulated slew since boot, so they
+ * must never be subtracted from one another.
+ *
+ * @return current CLOCK_MONOTONIC value, in nanoseconds
+ */
 static inline uint64_t host_ns()
 {
     struct timespec ts;
@@ -151,8 +168,19 @@ static inline uint64_t host_ns()
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-/* Sleep to an ABSOLUTE CLOCK_MONOTONIC deadline; EINTR retries the unchanged
- * deadline so the grid resumes rather than extends. */
+/**
+ * sleep_until_ns — block until an ABSOLUTE CLOCK_MONOTONIC deadline.
+ *
+ * Absolute rather than relative so the release grid cannot drift: a late wake
+ * eats into the next period instead of pushing every subsequent release back.
+ * EINTR retries the UNCHANGED deadline, so a signal resumes the cadence rather
+ * than extending it.
+ *
+ * A deadline already in the past returns immediately; the caller counts those
+ * as release_late, which must read 0 for the sweep to be on its intended grid.
+ *
+ * @param target_ns absolute CLOCK_MONOTONIC deadline, in nanoseconds
+ */
 static void sleep_until_ns(uint64_t target_ns)
 {
     struct timespec ts;
@@ -166,6 +194,15 @@ static void sleep_until_ns(uint64_t target_ns)
 // the completion instant means the same thing in all three arms.
 // ============================================================================
 
+/**
+ * wgc_gpu_ns — read the GPU's %globaltimer as a nanosecond timestamp.
+ *
+ * Device-side counterpart of host_ns().  %globaltimer is the clock W_i's
+ * completion endpoint is expressed in, and it free-runs independently of the
+ * CPU clocks, hence the calibration bracket.
+ *
+ * @return current %globaltimer value, in nanoseconds
+ */
 static __device__ __forceinline__ uint64_t wgc_gpu_ns()
 {
     uint64_t t;
@@ -173,6 +210,23 @@ static __device__ __forceinline__ uint64_t wgc_gpu_ns()
     return t;
 }
 
+/**
+ * wgcBusyWaitStamp — the measured GPU segment: busy-wait, then stamp completion.
+ *
+ * Byte-for-byte the kernel cpuWakeupLatencyBenchSeq and
+ * cpuWakeupLatencyStreamBaseline run, so the completion instant means the same
+ * thing in all three EQ 2.2 arms and W_i is comparable across them.
+ *
+ * The completion stamp is taken by the kernel's OWN LAST INSTRUCTION, which is
+ * what makes W_i independent of how long the segment ran: everything measured
+ * afterwards is wake path, not execution.  Single-threaded (thread 0 only) so
+ * the stamp is unambiguous.
+ *
+ * @param durationNs    device pointer to the busy-wait length, in ns
+ *                      (0 is valid and yields a stamp-only segment)
+ * @param completionOut device/pinned pointer receiving the %globaltimer value
+ *                      at segment end
+ */
 __global__ void wgcBusyWaitStamp(const uint64_t* durationNs,
                                  uint64_t*       completionOut)
 {
@@ -183,6 +237,15 @@ __global__ void wgcBusyWaitStamp(const uint64_t* durationNs,
     *completionOut = wgc_gpu_ns();
 }
 
+/**
+ * CUDA_CHECK — abort the enclosing function with EXIT_FAILURE on a CUDA error.
+ *
+ * Reports file, line and the runtime's own message.  Because it returns
+ * EXIT_FAILURE it is only usable from a function whose return type is int
+ * (in practice: main).
+ *
+ * @param call a CUDA runtime call returning cudaError_t
+ */
 #define CUDA_CHECK(call)                                                       \
     do {                                                                       \
         cudaError_t _e = (call);                                               \
@@ -199,6 +262,24 @@ __global__ void wgcBusyWaitStamp(const uint64_t* durationNs,
 // timed separately from the wait that precedes it.
 // ============================================================================
 
+/**
+ * gcaps_runlist — issue one GCAPS runlist-priority ioctl.
+ *
+ * The same call support.h's gcapsGpuSegBegin/gcapsGpuSegEnd make, open-coded
+ * here so the REMOVE ioctl can be timed separately from the wait that precedes
+ * it — W_i deliberately ends before this call, and the ioctl is reported as its
+ * own column (epsilon) rather than folded into the wake path.
+ *
+ * The driver decides whether the caller is a real-time task by reading its
+ * rt_priority, so this is only meaningful once apply_rt() has succeeded.
+ *
+ * @param fd        open file descriptor for the nvgpu control device
+ * @param pid       process whose TSGs are admitted or evicted
+ * @param add_req   true to admit (segment begin), false to remove (segment end)
+ * @param sync_mode driver-side path selector; UNRELATED to the CPU-side wait
+ *                  primitive despite the name
+ * @return the ioctl return value: >= 0 on success, < 0 with errno set
+ */
 static int gcaps_runlist(int fd, pid_t pid, bool add_req, bool sync_mode)
 {
     struct nvgpu_gpu_runlist_update_rt_prio_args args;
@@ -211,6 +292,22 @@ static int gcaps_runlist(int fd, pid_t pid, bool add_req, bool sync_mode)
 
 static int g_pinned_cpu = -1;   /* what actually took effect, for the banner */
 
+/**
+ * apply_rt — put the measuring thread on SCHED_FIFO and optionally pin it.
+ *
+ * Both steps are best-effort and warn rather than abort, but a failed
+ * sched_setscheduler INVALIDATES a `-i 1` run: the driver reads rt_priority to
+ * decide whether the caller is a real-time task at all, so every ioctl would
+ * silently take the best-effort branch.  On this kernel
+ * (CONFIG_RT_GROUP_SCHED=y) it fails even under sudo unless the caller has been
+ * moved into a cgroup with a non-zero cpu.rt_runtime_us, which is why
+ * run_gcaps_r35.sh is mandatory.
+ *
+ * Records the pin that actually took effect in g_pinned_cpu, so the banner and
+ * the CSV report what happened rather than what was requested.
+ *
+ * @param pin_cpu CPU to pin to, or negative to leave affinity untouched
+ */
 static void apply_rt(int pin_cpu)
 {
     struct sched_param sp;
@@ -243,6 +340,25 @@ static void apply_rt(int pin_cpu)
 // main
 // ============================================================================
 
+/**
+ * main — run the W_i sweep and write the per-release CSV.
+ *
+ * Sequence: parse options, apply RT (optionally before context creation via
+ * --rt-early), open the GCAPS device, take the start calibration bracket with
+ * the GPU idle, run `warmup` throwaway releases, then release n_jobs on an
+ * absolute grid.  Each release is add ioctl -> segment kernel ->
+ * cudaEventSynchronize -> RAW wakeup stamp -> remove ioctl, so the stamp lands
+ * before any GCAPS bookkeeping.  Finally the end bracket closes and W_i is
+ * computed in a post-run pass with the drift-corrected offset.
+ *
+ * The end-of-run calibration must itself be wrapped in a GCAPS add/remove
+ * bracket: unbracketed GPU work after the last remove ioctl never completes,
+ * because the process holds no runlist entry to run it on.
+ *
+ * @param argc argument count
+ * @param argv see the usage block at the top of this file
+ * @return EXIT_SUCCESS, or EXIT_FAILURE on a bad option or a CUDA/ioctl failure
+ */
 int main(int argc, char** argv)
 {
     uint64_t execUs          = 50;
