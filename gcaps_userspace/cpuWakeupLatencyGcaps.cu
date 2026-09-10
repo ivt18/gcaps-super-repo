@@ -10,7 +10,7 @@
  *
  *   completion_gpu_ns — %globaltimer written by the kernel's own last
  *                       instruction into a pinned slot.
- *   wakeup_cpu_ns     — CLOCK_MONOTONIC captured immediately after the GCAPS
+ *   wakeup_cpu_ns     — CLOCK_MONOTONIC_RAW captured immediately after the GCAPS
  *                       segment-end wait returns, before the remove ioctl.
  *
  * The wakeup stamp is taken before the remove ioctl: the thread is running
