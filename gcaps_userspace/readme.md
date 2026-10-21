@@ -116,7 +116,7 @@ GPU utilization by ×1/`SCALE` (mirrors singleTaskSched's `workloadTasksetBench
 -s SCALE`). Use it to push the taskset into contention so the GCAPS-vs-TSG
 difference becomes visible in the plots. **Caveat:** higher utilization means
 more preemption churn and a substantially higher chance of hitting the
-[runlist-cache-desync deadlock](../runlist-cache-desync-bug.md) — pair a small
+runlist-cache-desync deadlock — pair a small
 `SCALE` with a shorter `-d`, and expect that some runs may hang and need a
 reboot (see Troubleshooting).
 
@@ -124,8 +124,7 @@ reboot (see Troubleshooting).
 best-effort tasks (`mm_2048`, `hist_4M`) are run here at the two lowest
 `SCHED_FIFO` priorities instead of `SCHED_OTHER`. This avoids a GCAPS driver
 deadlock that triggers with **more than one concurrently-running best-effort GPU
-task** (a lost-update in the runlist remove logic — see
-[`best-effort-tasks-bug.md`](../best-effort-tasks-bug.md)), and it matches the
+task** (a lost update in the runlist remove logic), and it matches the
 SequenceScheduler benchmark, which priority-schedules every GPU task and has no
 best-effort class. (Earlier this looked like a "6 concurrent GPU contexts" limit;
 the real cause was the second best-effort task — `-k 5` happened to drop it.)
@@ -168,8 +167,7 @@ into ε (red) + other latency (grey) in the breakdown and Gantt. Without the log
 those fall back to the single overhead band and `epsilon.pdf` is skipped.
 
 ### Troubleshooting the taskset
-- **`-i 1` hangs but `-i 0` works.** This was the best-effort-task deadlock (see
-  [`best-effort-tasks-bug.md`](../best-effort-tasks-bug.md)), now avoided by
+- **`-i 1` hangs but `-i 0` works.** This was the best-effort-task deadlock, now avoided by
   running all tasks as real-time. If it recurs, confirm `SCHED_FIFO` actually
   took effect (no `SCHED_FIFO … failed` warnings — needs `sched_rt_runtime_us=-1`);
   with tasks silently falling back to `SCHED_OTHER` they become best-effort again

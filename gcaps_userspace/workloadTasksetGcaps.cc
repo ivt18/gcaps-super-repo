@@ -16,8 +16,7 @@
  * Priorities are DEADLINE-MONOTONIC (shorter T = D => higher priority), NOT
  * the GCAPS Table 4 assignment, matching the source benchmark.  ALL tasks are
  * real-time (SCHED_FIFO); there are no best-effort tasks (which also avoids
- * the GCAPS driver deadlock with >1 best-effort GPU task — see
- * best-effort-tasks-bug.md).
+ * the GCAPS driver deadlock with >1 best-effort GPU task).
  *
  *   1  hist_128M      histogram 128M   C=1ms  T=100ms CPU={1}   FIFO=8
  *   2  mm_2048        matmul 2048      C=2ms  T=150ms CPU={2}   FIFO=6
@@ -120,8 +119,8 @@ struct BenchTaskDef {
 /* Deadline-monotonic priorities (shorter T = D => higher priority), matching
  * the source benchmark: SCHED_FIFO ranks all 8 tasks 8..1 by deadline.  All
  * tasks are real-time — no best-effort tasks, which (a) avoids the GCAPS
- * driver best-effort deadlock (>1 concurrently-running best-effort GPU task —
- * see best-effort-tasks-bug.md) and (b) matches the SequenceScheduler
+ * driver best-effort deadlock (>1 concurrently-running best-effort GPU task)
+ * and (b) matches the SequenceScheduler
  * benchmark, which priority-schedules every GPU task. */
 static const BenchTaskDef TASKS[NUM_TASKS] = {
 	{"hist_128M",     true,  SeqWlType::HISTOGRAM,   128u << 20, 0,  1, 100, {1, -1}, 8},
@@ -304,7 +303,7 @@ static void run_task(int task_idx, int fd, bool sync_mode, bool ioctl_enabled,
 		 * synchronized start, because GCAPS runlist rebuilds interleaved
 		 * with the later tasks' context bring-up (a normal-path runlist
 		 * writer) stale the driver's runlist cache and raise the odds of
-		 * the mid-run cache-desync hang (see runlist-cache-desync-bug.md).
+		 * the mid-run cache-desync hang.
 		 * Unbracketed launches are safe at init time precisely because no
 		 * ioctl has run yet. */
 		for (int w = 0; w < g_warmup_runs; ++w)

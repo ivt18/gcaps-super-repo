@@ -58,4 +58,7 @@ patches
 files_src
 
 # Python
-*/__pycache__
+__pycache__/
+
+# Benchmark output (gcaps_userspace/results/workloadBench/...)
+gcaps_userspace/results/

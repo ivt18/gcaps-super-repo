@@ -480,7 +480,7 @@
 +				 * Falling through to the branch below would OVERWRITE
 +				 * tsg_running with the next pending task, evicting the
 +				 * running preemptor mid-kernel and deadlocking it on its
-+				 * fence.  See preempted-caller-runlist-overwrite-bug.md */
++				 * fence. */
 +				*rl_ctrl->tsg_pending &= ~(*tsgs_cpid);
 +			}else {
 +				resumed_pid = pid_next; /* this task is resumed back into the runlist */
