@@ -97,7 +97,11 @@ def main():
     ap.add_argument('--gm', type=float, default=42.4,
                     help='CPU work that submits one GPU segment, us')
     ap.add_argument('--families', nargs='+', default=DEFAULT_FAMILIES)
+    ap.add_argument('--per-set-csv', default=None,
+                    help='also write one row per task set: family, id, util_target, '
+                         'our verdict (with --results), and the GCAPS verdict per epsilon')
     args = ap.parse_args()
+    per_set = []
 
     cols = ['family', 'n']
     if args.results:
@@ -120,16 +124,27 @@ def main():
             c['n'] += 1
             if ours is not None:
                 c['ours ' + ours[sid]] += 1
+            row = {'family': fam, 'task_set_id': sid, 'util_target': ts['util_target'],
+                   'ours': ours[sid] if ours is not None else ''}
             for e in args.epsilon:
                 gcaps.epsilon = e
-                if gcaps.rt_test(build(ts, args.gm), False, 0):
+                ok = gcaps.rt_test(build(ts, args.gm), False, 0)
+                row[f'gcaps_eps_{e:g}'] = ok
+                if ok:
                     c[f'GCAPS eps={e:g}'] += 1
                     if ours is not None and ours[sid] == 'sched':
                         c[f'both eps={e:g}'] += 1
+            per_set.append(row)
         for k in cols[1:]:
             total[k] += c[k]
         print('\t'.join([fam] + [str(c[k]) for k in cols[1:]]))
     print('\t'.join(['TOTAL'] + [str(total[k]) for k in cols[1:]]))
+
+    if args.per_set_csv:
+        with open(args.per_set_csv, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=list(per_set[0].keys()))
+            w.writeheader()
+            w.writerows(per_set)
 
 
 if __name__ == '__main__':
